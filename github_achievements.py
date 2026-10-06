@@ -118,7 +118,8 @@ class GitHubClient:
     - On HTTP 403/429 it honors ``Retry-After`` with exponential backoff
       (``min(2**attempt * int(retry_after or 1), 120)``), retrying at most
       ``MAX_RETRIES`` times before raising ``GHError``.
-    - ``dry_run=True`` logs the intended call and returns ``{}`` — zero writes.
+    - ``dry_run=True`` prints and logs the intended call, returns ``{}`` —
+      zero writes.
     """
 
     GHError = GHError
@@ -145,7 +146,9 @@ class GitHubClient:
         """
         method = method.upper()
         if self.dry_run:
-            self.log(f"DRY-RUN {method} {path} body={json.dumps(body)}")
+            line = f"DRY-RUN {method} {path} body={json.dumps(body)}"
+            print(line)
+            self.log(line)
             return {}
         if method in MUTATING_METHODS:
             time.sleep(self.delay)
@@ -173,6 +176,9 @@ class GitHubClient:
                 if status in (403, 429) and attempt < MAX_RETRIES:
                     wait = min(2 ** attempt * int(retry_after or 1),
                                BACKOFF_CAP_SECONDS)
+                    if method not in ("GET", "HEAD"):
+                        # keep the politeness floor between mutating calls
+                        wait = max(wait, self.delay)
                     self.log(f"{method} {path} -> {status}; "
                              f"retry {attempt + 1}/{MAX_RETRIES} in {wait}s")
                     time.sleep(wait)

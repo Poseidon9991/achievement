@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from urllib.error import HTTPError
 
@@ -191,6 +191,23 @@ class RetryTests(ClientTestCase):
         self.assertEqual(cm.exception.retry_after, 1)
         self.assertEqual(m_open.call_count, 4)  # initial + max 3 retries
 
+    def test_mutating_retry_wait_is_floored_to_delay(self):
+        """A retried mutating call still waits at least `delay` seconds,
+        even when the Retry-After backoff computes less."""
+        client = ga.GitHubClient("tok", delay=2.5)
+        err = _http_error(403, {"message": "secondary rate limit"},
+                          headers={"Retry-After": "1"})
+        ok = _json_response({"ok": True})
+        with mock.patch("urllib.request.urlopen", side_effect=[err, ok]) as m_open, \
+                mock.patch("time.sleep") as m_sleep:
+            result = client.rest("PATCH", "/repos/o/r/issues/1",
+                                 {"state": "closed"})
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(m_open.call_count, 2)
+        # politeness sleep, then backoff max(1s, delay) = delay
+        self.assertEqual(m_sleep.call_args_list,
+                         [mock.call(2.5), mock.call(2.5)])
+
 
 class GraphQLTests(ClientTestCase):
     def test_errors_key_raises_gherror(self):
@@ -212,6 +229,25 @@ class GraphQLTests(ClientTestCase):
             m_open.return_value = _json_response(payload)
             result = client.graphql("query { viewer { login } }")
         self.assertEqual(result, {"viewer": {"login": "me"}})
+
+
+class DryRunTests(ClientTestCase):
+    def test_dry_run_makes_no_calls_and_prints_plan(self):
+        client = ga.GitHubClient(token="t", dry_run=True, delay=2.5)
+        buf = io.StringIO()
+        with mock.patch("urllib.request.urlopen") as m_open, \
+                mock.patch("time.sleep") as m_sleep, \
+                redirect_stdout(buf):
+            rest_result = client.rest("POST", "/x", {"a": 1})
+            gql_result = client.graphql("query { viewer { login } }")
+        m_open.assert_not_called()
+        m_sleep.assert_not_called()
+        self.assertEqual(rest_result, {})
+        self.assertEqual(gql_result, {})
+        log_contents = self.read_log()
+        self.assertIn("DRY-RUN POST /x", log_contents)
+        self.assertIn("DRY-RUN POST /x", buf.getvalue())
+        self.assertIn("DRY-RUN POST /graphql", buf.getvalue())
 
 
 class LogTests(unittest.TestCase):
