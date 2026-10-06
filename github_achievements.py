@@ -142,17 +142,13 @@ class GHError(Exception):
         self.retry_after = retry_after
 
 
-def load_token(cli_token: str | None) -> str:
-    """Resolve the GitHub token: CLI flag > ``GITHUB_TOKEN`` env var > ``.env``.
+def _dotenv_token() -> str | None:
+    """Read ``GITHUB_TOKEN`` from the ``.env`` file, if present.
 
-    ``.env`` is read line-by-line; only a ``GITHUB_TOKEN=...`` entry counts.
-    Prints PAT instructions and raises ``SystemExit(1)`` if nothing is found.
+    The file is read line-by-line; only a non-empty ``GITHUB_TOKEN=...``
+    entry counts. Returns ``None`` when the file is missing, unreadable,
+    or has no usable entry — this helper never prints or exits.
     """
-    if cli_token:
-        return cli_token
-    env_token = os.environ.get("GITHUB_TOKEN")
-    if env_token:
-        return env_token
     try:
         with open(ENV_PATH, encoding="utf-8") as fh:
             for line in fh:
@@ -167,6 +163,23 @@ def load_token(cli_token: str | None) -> str:
                     return value
     except OSError:
         pass
+    return None
+
+
+def load_token(cli_token: str | None) -> str:
+    """Resolve the GitHub token: CLI flag > ``GITHUB_TOKEN`` env var > ``.env``.
+
+    ``.env`` is read line-by-line; only a ``GITHUB_TOKEN=...`` entry counts.
+    Prints PAT instructions and raises ``SystemExit(1)`` if nothing is found.
+    """
+    if cli_token:
+        return cli_token
+    env_token = os.environ.get("GITHUB_TOKEN")
+    if env_token:
+        return env_token
+    dotenv_token = _dotenv_token()
+    if dotenv_token:
+        return dotenv_token
     print(
         "No GitHub token found. Provide one via --token, the GITHUB_TOKEN "
         "environment variable, or a .env file containing GITHUB_TOKEN=<token>.\n"
@@ -205,13 +218,16 @@ def parse_coauthor(raw: str) -> tuple[str, str]:
 
 
 def _retry_after_seconds(raw: str | None) -> int | None:
-    """Parse a Retry-After header value; non-numeric/missing -> ``None``."""
+    """Parse a Retry-After header value; non-numeric, missing, or
+    negative -> ``None`` (a negative value must never become a negative
+    ``time.sleep``; the caller falls back to its default backoff)."""
     if raw is None:
         return None
     try:
-        return int(raw)
+        value = int(raw)
     except (TypeError, ValueError):
         return None
+    return value if value >= 0 else None
 
 
 def _error_message(raw_body: bytes) -> str:
@@ -307,7 +323,14 @@ class GitHubClient:
             self.log(f"{method} {path} -> {status}")
             if status == 204 or not raw:
                 return {}
-            return json.loads(raw.decode("utf-8"))
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                # A 2xx body that is not JSON must surface as GHError, not
+                # an escaping ValueError that kills the caller's flow.
+                message = f"non-JSON response from {method} {path}"
+                self.log(f"{method} {path} -> {status}: {message}")
+                raise GHError(status, message) from None
         raise GHError(0, f"{method} {path}: exhausted retries")
 
     def graphql(self, query: str, variables: dict | None = None) -> dict:
@@ -620,7 +643,15 @@ def pr_cycle(client: GitHubClient, owner: str, repo: str,
     info = client.rest("GET", base)
     default_branch = info.get("default_branch") or "main"
     head_ref = client.rest("GET", f"{base}/git/refs/heads/{default_branch}")
-    sha = (head_ref.get("object") or {}).get("sha") or "0" * 40
+    sha = (head_ref.get("object") or {}).get("sha")
+    if not sha:
+        if client.dry_run:
+            sha = "0" * 40  # dry-run GETs return {}; keep printing the plan
+        else:
+            # fail fast: never POST /git/refs with a fabricated sha
+            raise GHError(
+                0, f"no commit sha for heads/{default_branch} in the ref "
+                   "response; refusing to create a branch")
 
     stamp = time.time_ns()
     branch = f"shark-pr-{label}-{stamp}"
@@ -638,7 +669,14 @@ def pr_cycle(client: GitHubClient, owner: str, repo: str,
                       "base": default_branch,
                       "body": f"Automated PR for {label}; merged "
                               "immediately by github_achievements."})
-    number = pr.get("number") or 0
+    number = pr.get("number")
+    if not number:
+        if client.dry_run:
+            number = 0  # dry-run POSTs return {}; keep printing the plan
+        else:
+            # fail fast: never PUT /pulls/0/merge on a malformed response
+            raise GHError(
+                0, "no PR number in the create response; refusing to merge")
     client.rest("PUT", f"{base}/pulls/{number}/merge",
                 {"merge_method": "merge"})
 
@@ -664,7 +702,15 @@ def badge_quickdraw(client: GitHubClient, owner: str, repo: str) -> bool:
             {"title": "Quickdraw test issue",
              "body": "Opened and closed immediately to earn the "
                      "Quickdraw achievement."})
-        number = issue.get("number") or 0
+        number = issue.get("number")
+        if not number:
+            if client.dry_run:
+                number = 0  # dry-run POSTs return {}; keep printing the plan
+            else:
+                # fail fast: never PATCH /issues/0 on a malformed response
+                raise GHError(
+                    0, "no issue number in the create response; refusing "
+                       "to close a fabricated issue")
         client.rest("PATCH", f"{base}/issues/{number}",
                     {"state": "closed"})
     except GHError as exc:
@@ -1077,8 +1123,9 @@ def _cli_unlock(client: GitHubClient,
     (quickdraw -> yolo -> pull-shark -> galaxy-brain ->
     pair-extraordinaire).
 
-    Each step is wrapped so a ``GHError`` is reported without stopping the
-    others; a final summary table lists every step's status. Galaxy Brain
+    Each step is wrapped so a ``GHError`` — or any unexpected exception
+    — is reported without stopping the others; a final summary table
+    lists every step's status. Galaxy Brain
     returning ``-1`` (self-marking blocked) is a WARNING, not a failure.
     Without ``--coauthor``, Pair Extraordinaire is skipped with a notice
     explaining how to pass it. Returns 1 when any step FAILED, else 0.
@@ -1112,6 +1159,11 @@ def _cli_unlock(client: GitHubClient,
     except GHError as exc:
         results.append(("publish", "FAILED", str(exc)))
         print(f"publish failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        detail = f"unexpected error: {exc!r}"
+        results.append(("publish", "FAILED", detail))
+        client.log(f"unlock: publish {detail}")
+        print(f"publish {detail}", file=sys.stderr)
 
     try:
         if badge_quickdraw(client, owner, name):
@@ -1122,6 +1174,11 @@ def _cli_unlock(client: GitHubClient,
     except GHError as exc:
         results.append(("Quickdraw", "FAILED", str(exc)))
         print(f"Quickdraw failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        detail = f"unexpected error: {exc!r}"
+        results.append(("Quickdraw", "FAILED", detail))
+        client.log(f"unlock: Quickdraw {detail}")
+        print(f"Quickdraw {detail}", file=sys.stderr)
 
     try:
         if badge_yolo(client, owner, name):
@@ -1132,6 +1189,11 @@ def _cli_unlock(client: GitHubClient,
     except GHError as exc:
         results.append(("YOLO", "FAILED", str(exc)))
         print(f"YOLO failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        detail = f"unexpected error: {exc!r}"
+        results.append(("YOLO", "FAILED", detail))
+        client.log(f"unlock: YOLO {detail}")
+        print(f"YOLO {detail}", file=sys.stderr)
 
     try:
         done = badge_pull_shark(client, owner, name,
@@ -1141,6 +1203,11 @@ def _cli_unlock(client: GitHubClient,
     except GHError as exc:
         results.append(("Pull Shark", "FAILED", str(exc)))
         print(f"Pull Shark failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        detail = f"unexpected error: {exc!r}"
+        results.append(("Pull Shark", "FAILED", detail))
+        client.log(f"unlock: Pull Shark {detail}")
+        print(f"Pull Shark {detail}", file=sys.stderr)
 
     try:
         done = badge_galaxy_brain(client, owner, name,
@@ -1157,6 +1224,11 @@ def _cli_unlock(client: GitHubClient,
     except GHError as exc:
         results.append(("Galaxy Brain", "FAILED", str(exc)))
         print(f"Galaxy Brain failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        detail = f"unexpected error: {exc!r}"
+        results.append(("Galaxy Brain", "FAILED", detail))
+        client.log(f"unlock: Galaxy Brain {detail}")
+        print(f"Galaxy Brain {detail}", file=sys.stderr)
 
     if not args.coauthor:
         print('Pair Extraordinaire: skipped - pass '
@@ -1170,9 +1242,19 @@ def _cli_unlock(client: GitHubClient,
                 targets["pair_extraordinaire"])
             results.append(("Pair Extraordinaire", "OK",
                             f"{done} PR cycle(s) this run"))
-        except (GHError, ValueError) as exc:
+        except GHError as exc:
             results.append(("Pair Extraordinaire", "FAILED", str(exc)))
             print(f"Pair Extraordinaire failed: {exc}", file=sys.stderr)
+        except ValueError as exc:
+            # parse_coauthor's usage-hint message (with the
+            # --coauthor "Name <email>" example) is preserved verbatim
+            results.append(("Pair Extraordinaire", "FAILED", str(exc)))
+            print(f"Pair Extraordinaire failed: {exc}", file=sys.stderr)
+        except Exception as exc:
+            detail = f"unexpected error: {exc!r}"
+            results.append(("Pair Extraordinaire", "FAILED", detail))
+            client.log(f"unlock: Pair Extraordinaire {detail}")
+            print(f"Pair Extraordinaire {detail}", file=sys.stderr)
 
     width = max(len(step) for step, _, _ in results)
     print("\nUnlock summary:")
@@ -1243,11 +1325,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "manual":
         return cmd_manual()
-    token = load_token(args.token)
+    dry_run = bool(getattr(args, "dry_run", False))
+    token = args.token or os.environ.get("GITHUB_TOKEN") or _dotenv_token()
+    if not token:
+        if dry_run:
+            # --dry-run never makes an authenticated call (no live GETs,
+            # no writes), so a missing token is tolerable: use a
+            # placeholder and keep printing the plan.
+            token = "dry-run"
+        else:
+            # doctor/status (and live runs) need a real token — print the
+            # PAT instructions and exit 1
+            token = load_token(args.token)
     # dry-run constructs only the dry-run client — a live, writing client
     # is never instantiated when --dry-run is passed
-    client = GitHubClient(token, dry_run=bool(getattr(args, "dry_run",
-                                                      False)))
+    client = GitHubClient(token, dry_run=dry_run)
     if args.command == "doctor":
         cmd_doctor(client)
         return 0

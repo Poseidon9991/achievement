@@ -244,6 +244,20 @@ class RestTests(ClientTestCase):
         self.assertIn("Not Found", cm.exception.message)
 
 
+    def test_non_json_2xx_body_raises_gherror(self):
+        """A 2xx body that is not JSON surfaces as GHError (status = the
+        HTTP status, message notes the non-JSON body), never an escaping
+        ValueError from json.loads."""
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch("urllib.request.urlopen") as m_open:
+            m_open.return_value = _make_response(b"<html>not json</html>")
+            with self.assertRaises(ga.GHError) as cm:
+                client.rest("GET", "/user")
+        self.assertEqual(cm.exception.status, 200)
+        self.assertIn("non-JSON", cm.exception.message)
+        self.assertIn("non-JSON", self.read_log())
+
+
 class RetryTests(ClientTestCase):
     def test_403_retry_after_retries_once_then_succeeds(self):
         client = ga.GitHubClient("tok", delay=0)
@@ -285,6 +299,22 @@ class RetryTests(ClientTestCase):
         # politeness sleep, then backoff max(1s, delay) = delay
         self.assertEqual(m_sleep.call_args_list,
                          [mock.call(2.5), mock.call(2.5)])
+
+    def test_negative_retry_after_retries_with_default_backoff(self):
+        """Retry-After: -5 must not become a negative time.sleep (which
+        raises ValueError); it is clamped away and the retry proceeds
+        with the default 1s base."""
+        client = ga.GitHubClient("tok", delay=0)
+        err = _http_error(403, {"message": "secondary rate limit"},
+                          headers={"Retry-After": "-5"})
+        ok = _json_response({"login": "me"})
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[err, ok]) as m_open, \
+                mock.patch("time.sleep") as m_sleep:
+            result = client.rest("GET", "/user")  # GET: no delay floor
+        self.assertEqual(result, {"login": "me"})
+        self.assertEqual(m_open.call_count, 2)
+        m_sleep.assert_called_once_with(1)  # 2**0 * (None or 1)
 
 
 class GraphQLTests(ClientTestCase):
@@ -800,6 +830,61 @@ class PrCycleTests(ClientTestCase):
                 if m == "POST" and p == "/repos/o/r/git/refs"]
         self.assertEqual(len(set(refs)), 2)
 
+    def test_missing_sha_fails_fast_before_branch_creation(self):
+        """A ref response without object.sha raises GHError instead of
+        firing a doomed POST /git/refs with a fabricated all-zero sha."""
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+
+        def fake_rest(method, path, body=None):
+            calls.append((method, path))
+            if method == "GET" and path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if method == "GET" and path == "/repos/o/r/git/refs/heads/main":
+                return {}  # malformed: no object.sha
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest):
+            with self.assertRaises(ga.GHError) as cm:
+                ga.pr_cycle(client, "o", "r", "x", "msg")
+        self.assertIn("sha", str(cm.exception))
+        # nothing after the malformed GET was attempted
+        self.assertEqual([m for m, _ in calls], ["GET", "GET"])
+
+    def test_missing_pr_number_fails_fast_before_merge(self):
+        """A create-PR response without a number raises GHError instead
+        of firing a doomed PUT /pulls/0/merge."""
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+
+        def fake_rest(method, path, body=None):
+            calls.append((method, path))
+            if method == "GET" and path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if method == "GET" and path == "/repos/o/r/git/refs/heads/main":
+                return {"object": {"sha": "abc123"}}
+            if method == "POST" and path == "/repos/o/r/pulls":
+                return {}  # malformed: no number
+            return {}
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest):
+            with self.assertRaises(ga.GHError) as cm:
+                ga.pr_cycle(client, "o", "r", "x", "msg")
+        self.assertIn("PR number", str(cm.exception))
+        self.assertFalse(any(p.endswith("/merge") for _, p in calls))
+
+    def test_dry_run_tolerates_missing_fields_and_prints_plan(self):
+        """In dry-run every response is {}; the missing sha/number must be
+        tolerated so the plan prints (no crash, no fabricated live calls)."""
+        client = ga.GitHubClient("tok", dry_run=True, delay=0)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            number = ga.pr_cycle(client, "o", "r", "x", "msg")
+        self.assertEqual(number, 0)
+        out = buf.getvalue()
+        self.assertIn("DRY-RUN POST /repos/o/r/git/refs", out)
+        self.assertIn("DRY-RUN PUT /repos/o/r/pulls/0/merge", out)
+
 
 class QuickdrawTests(ClientTestCase):
     """badge_quickdraw: open an issue, close it immediately."""
@@ -832,6 +917,26 @@ class QuickdrawTests(ClientTestCase):
                 side_effect=ga.GHError(403, "forbidden")), \
                 redirect_stderr(io.StringIO()):
             self.assertFalse(ga.badge_quickdraw(client, "o", "r"))
+
+    def test_missing_issue_number_fails_fast_without_patch(self):
+        """A create-issue response without a number raises GHError
+        (caught -> False) instead of firing a doomed PATCH /issues/0."""
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+
+        def fake_rest(method, path, body=None):
+            calls.append((method, path))
+            if method == "POST" and path == "/repos/o/r/issues":
+                return {}  # malformed: no number
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest), \
+                redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()):
+            result = ga.badge_quickdraw(client, "o", "r")
+        self.assertFalse(result)
+        # only the create ran — no fabricated /issues/0 close
+        self.assertEqual([m for m, _ in calls], ["POST"])
 
 
 class YoloTests(ClientTestCase):
@@ -898,6 +1003,32 @@ class PullSharkTests(ClientTestCase):
             result = ga.badge_pull_shark(client, "octocat", "achievement", 16)
         m_cycle.assert_not_called()
         self.assertEqual(result, 0)
+
+    def test_mid_loop_failure_propagates_and_resume_is_idempotent(self):
+        """A pr_cycle GHError mid-loop propagates (current contract), and
+        a re-run after the merged PRs landed performs only the remaining
+        cycles — pinning both the error surfacing and resume semantics."""
+        client = ga.GitHubClient("tok", delay=0)
+        # run 1: 0 merged, target 5; the 3rd of 5 cycles blows up
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(0)), \
+                mock.patch.object(
+                    ga, "pr_cycle",
+                    side_effect=[1, 2, ga.GHError(422, "boom")]) as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(ga.GHError) as cm:
+                ga.badge_pull_shark(client, "octocat", "achievement", 5)
+        self.assertEqual(cm.exception.status, 422)
+        self.assertEqual(m_cycle.call_count, 3)  # stopped at the failure
+        # run 2: the 2 merges from run 1 now count -> only 3 cycles remain
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(2)), \
+                mock.patch.object(ga, "pr_cycle",
+                                  return_value=3) as m_cycle2, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_pull_shark(client, "octocat", "achievement", 5)
+        self.assertEqual(result, 3)
+        self.assertEqual(m_cycle2.call_count, 3)  # idempotent resume
 
 
 class GalaxyBrainTests(ClientTestCase):
@@ -1326,6 +1457,14 @@ class MainTests(ClientTestCase):
                         "default_branch": "main",
                         "html_url":
                             "https://github.com/octocat/achievement"}
+            # realistic payloads for the fields the badge drivers inspect
+            # (missing numbers/shas are treated as malformed responses)
+            if path == f"{self.REPO_PATH}/git/refs/heads/main":
+                return {"object": {"sha": "abc123"}}
+            if path == f"{self.REPO_PATH}/issues":
+                return {"number": 1}
+            if path == f"{self.REPO_PATH}/pulls":
+                return {"number": 2}
             return {}
 
         def fake_graphql(query, variables=None):
@@ -1456,6 +1595,50 @@ class MainTests(ClientTestCase):
         self.assertIn("Pull Shark: 0/1 merged", out)
         self.assertIn("Galaxy Brain", out)
         self.assertIn("Unlock summary", out)
+
+    def test_unlock_unexpected_exception_is_isolated_per_step(self):
+        """A non-GHError exception in one badge step (e.g. TypeError on a
+        malformed payload) is caught: the badge is marked FAILED, a
+        generic unexpected-error line goes to stderr and the log, and the
+        remaining badges plus the summary table still run."""
+        client, calls = self._fake_client()
+        with mock.patch.object(
+                ga, "badge_pull_shark",
+                side_effect=TypeError("malformed payload")):
+            rc, out, err = self._run_main(
+                ["unlock", "--token", "t", "--tier", "base"], client)
+        self.assertEqual(rc, 1)
+        self.assertRegex(out, r"Pull Shark\s+FAILED")
+        self.assertIn("unexpected error", err)
+        self.assertIn("TypeError('malformed payload')", err)
+        # the unexpected error also went to the activity log
+        client.log.assert_any_call(
+            "unlock: Pull Shark unexpected error: "
+            "TypeError('malformed payload')")
+        # later badges still ran and the summary table was printed
+        self.assertIn("Galaxy Brain", out)
+        self.assertIn("Pair Extraordinaire", out)
+        self.assertIn("Unlock summary", out)
+
+    def test_unlock_dry_run_without_token_exits_0_and_prints_plan(self):
+        """No token anywhere (flag/env/.env) + --dry-run: a placeholder
+        token is used, no live client is built, and the plan prints with
+        exit 0 — doctor/status still exit 1 in that situation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, ".env")
+            with mock.patch.object(ga, "ENV_PATH", missing), \
+                    mock.patch.dict(os.environ):
+                os.environ.pop("GITHUB_TOKEN", None)
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch("urllib.request.urlopen") as m_open, \
+                        mock.patch("subprocess.run") as m_run, \
+                        redirect_stdout(out), redirect_stderr(err):
+                    rc = ga.main(["unlock", "--dry-run"])
+        self.assertEqual(rc, 0, msg=out.getvalue() + err.getvalue())
+        m_open.assert_not_called()
+        m_run.assert_not_called()
+        self.assertIn("Unlock plan", out.getvalue())
+        self.assertIn("DRY-RUN", out.getvalue())
 
     def test_unlock_rejects_repo_owned_by_another_user(self):
         client, calls = self._fake_client()
