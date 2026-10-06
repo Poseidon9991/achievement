@@ -15,6 +15,8 @@ cleanup pipeline — and the three badge drivers built on it:
 Task 5 adds ``badge_galaxy_brain`` — Discussions Q&A over GraphQL
 (createDiscussion -> addDiscussionComment -> markDiscussionCommentAsAnswer)
 with a clean fallback when GitHub disallows self-marking answers.
+Task 6 adds ``badge_pair_extraordinaire`` — merged PRs whose commits
+carry a ``Co-authored-by`` trailer, validated by ``parse_coauthor``.
 """
 
 from __future__ import annotations
@@ -170,6 +172,28 @@ def load_token(cli_token: str | None) -> str:
 def format_coauthor_trailer(name: str, email: str) -> str:
     """Return the git ``Co-authored-by`` trailer for a commit message."""
     return f"Co-authored-by: {name} <{email}>"
+
+
+_COAUTHOR_RE = re.compile(r"^\s*(.+?)\s*<([^<>]*)>\s*$")
+
+
+def parse_coauthor(raw: str) -> tuple[str, str]:
+    """Validate ``"Name <email>"`` and return ``(name, email)``.
+
+    Raises ``ValueError`` — with the ``--coauthor "Name <email>"`` usage
+    example in the message — when the angle brackets or the email are
+    missing, or when either part is empty after trimming.
+    """
+    match = _COAUTHOR_RE.match(raw or "")
+    if match:
+        name = match.group(1).strip()
+        email = match.group(2).strip()
+        if name and email:
+            return name, email
+    raise ValueError(
+        f"invalid co-author {raw!r}: use "
+        '--coauthor "Name <email>" '
+        '(e.g. --coauthor "Ada Lovelace <ada@x.io>")')
 
 
 def _retry_after_seconds(raw: str | None) -> int | None:
@@ -844,4 +868,77 @@ def badge_galaxy_brain(client: GitHubClient, owner: str, repo: str,
               f"({done}/{remaining})")
     client.log(f"galaxy_brain: {owner}/{repo} ran {done} answer(s) "
                f"toward {target}")
+    return done
+
+
+def badge_pair_extraordinaire(client: GitHubClient, owner: str, repo: str,
+                              coauthor: str, target: int) -> int:
+    """Merge co-authored PRs until ``target`` merged PRs with a
+    ``Co-authored-by`` trailer exist in ``owner/repo``; returns how many
+    cycles ran this invocation.
+
+    ``coauthor`` is validated by ``parse_coauthor`` first — invalid
+    input fails fast before any API call is made. Each cycle is a plain
+    ``pr_cycle`` whose commit message ends with
+    ``"\\n\\n" + format_coauthor_trailer(name, email)``, so the co-author
+    credit lands in the commit trailer where Pair Extraordinaire looks
+    for it.
+
+    Idempotency: the closed-PR list (same shape as ``count_merged_prs``
+    — merged, authored by the authenticated user) is scanned, fetching
+    each merged PR's commits via ``GET /pulls/{n}/commits?per_page=10``
+    and counting PRs where ANY commit message contains
+    ``Co-authored-by:``. The scan is bounded to the first 50 merged PRs;
+    ``remaining = max(0, target - counted)`` cycles run.
+    """
+    name, email = parse_coauthor(coauthor)  # fail fast, before any API call
+    trailer = format_coauthor_trailer(name, email)
+
+    login = client.rest("GET", "/user").get("login")
+    pulls = client.rest(
+        "GET", f"/repos/{owner}/{repo}/pulls?state=closed&per_page=100")
+    coauthored = 0
+    scanned = 0
+    if isinstance(pulls, list):
+        for pr in pulls:
+            if scanned >= 50:
+                break  # bounded scan: first 50 merged PRs only
+            if not isinstance(pr, dict) or pr.get("merged_at") is None:
+                continue
+            if (pr.get("user") or {}).get("login") != login:
+                continue
+            scanned += 1
+            commits = client.rest(
+                "GET",
+                f"/repos/{owner}/{repo}/pulls/{pr.get('number')}"
+                f"/commits?per_page=10")
+            if not isinstance(commits, list):
+                continue
+            if any(
+                "Co-authored-by:" in
+                ((c.get("commit") or {}).get("message") or "")
+                for c in commits if isinstance(c, dict)
+            ):
+                coauthored += 1
+
+    remaining = max(0, target - coauthored)
+    if remaining == 0:
+        print(f"Pair Extraordinaire: already at {coauthored}/{target} "
+              "co-authored merged PRs; nothing to do.")
+        client.log(f"pair_extraordinaire: {owner}/{repo} already at "
+                   f"{coauthored}/{target}")
+        return 0
+    print(f"Pair Extraordinaire: {coauthored}/{target} co-authored "
+          f"merged PRs; running {remaining} PR cycle(s).")
+    done = 0
+    for i in range(remaining):
+        n = coauthored + i + 1
+        number = pr_cycle(
+            client, owner, repo,
+            f"pair-extraordinaire-{n}",
+            f"Pair Extraordinaire PR {n}/{target}\n\n{trailer}")
+        done += 1
+        print(f"  merged PR #{number} ({done}/{remaining})")
+    client.log(f"pair_extraordinaire: {owner}/{repo} ran {done} "
+               f"cycle(s) toward {target}")
     return done

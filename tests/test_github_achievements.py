@@ -1,10 +1,12 @@
-"""Tests for github_achievements.py — Tasks 1-5.
+"""Tests for github_achievements.py — Tasks 1-6.
 
 Task 1: client core + token loading. Task 2: doctor/status commands and
 profile badge parsing. Task 3: publish command (repo creation + git push).
 Task 4: PR engine (pr_cycle, count_merged_prs) plus the quickdraw, yolo,
 and pull-shark badge drivers. Task 5: badge_galaxy_brain — Discussions
-Q&A with a self-mark-disallowed fallback.
+Q&A with a self-mark-disallowed fallback. Task 6: parse_coauthor and
+badge_pair_extraordinaire — merged PRs whose commits carry a
+Co-authored-by trailer.
 """
 
 import base64
@@ -1092,6 +1094,149 @@ class GalaxyBrainTests(ClientTestCase):
         self.assertIn('"has_discussions": true', out)
         self.assertIn("8", out)
         self.assertIn("discussion", out)
+
+
+class ParseCoauthorTests(unittest.TestCase):
+    """parse_coauthor: 'Name <email>' -> (name, email); anything missing
+    the email or the angle brackets raises ValueError with a usage hint."""
+
+    def test_valid_name_email(self):
+        self.assertEqual(ga.parse_coauthor("Ada <ada@x.io>"),
+                         ("Ada", "ada@x.io"))
+
+    def test_name_with_spaces(self):
+        self.assertEqual(ga.parse_coauthor("Ada Lovelace <ada@x.io>"),
+                         ("Ada Lovelace", "ada@x.io"))
+
+    def test_missing_email_or_brackets_raise_with_usage(self):
+        for raw in ("Ada", "Ada ada@x.io"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError) as cm:
+                    ga.parse_coauthor(raw)
+                self.assertIn('--coauthor "Name <email>"',
+                              str(cm.exception))
+
+    def test_empty_name_or_email_raise_with_usage(self):
+        for raw in ("<ada@x.io>", "Ada <>", ""):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError) as cm:
+                    ga.parse_coauthor(raw)
+                self.assertIn('--coauthor "Name <email>"',
+                              str(cm.exception))
+
+
+class PairExtraordinaireTests(ClientTestCase):
+    """badge_pair_extraordinaire: pr_cycles whose commit message ends with
+    a Co-authored-by trailer; idempotent via merged PRs that already
+    carry the trailer on any of their commits."""
+
+    PULLS_PATH = "/repos/octocat/achievement/pulls?state=closed&per_page=100"
+    COMMITS_PREFIX = "/repos/octocat/achievement/pulls/"
+    COMMITS_SUFFIX = "/commits?per_page=10"
+    COAUTHOR = "Ada Lovelace <ada@x.io>"
+    TRAILER = "Co-authored-by: Ada Lovelace <ada@x.io>"
+
+    def _fake_rest(self, coauthored: int, plain: int = 0):
+        """`coauthored` merged PRs whose commits contain the trailer, plus
+        `plain` merged PRs without it; unmerged PRs are ignored anyway."""
+        pulls = []
+        for i in range(coauthored + plain):
+            pulls.append({"number": i + 1, "merged_at": "x",
+                          "user": {"login": "octocat"}})
+        pulls.append({"number": coauthored + plain + 1,
+                      "merged_at": None,   # closed but unmerged
+                      "user": {"login": "octocat"}})
+        pulls.append({"number": coauthored + plain + 2,
+                      "merged_at": "x",    # merged by someone else
+                      "user": {"login": "someone-else"}})
+
+        def fake_rest(method, path, body=None):
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == self.PULLS_PATH:
+                return pulls
+            if (path.startswith(self.COMMITS_PREFIX)
+                    and path.endswith(self.COMMITS_SUFFIX)):
+                number = int(path[len(self.COMMITS_PREFIX):]
+                             .split("/")[0])
+                if number <= coauthored:
+                    return [{"commit": {"message":
+                                        "note\n\n" + self.TRAILER}},
+                            {"commit": {"message": "second commit"}}]
+                return [{"commit": {"message": "plain commit"}}]
+            raise AssertionError(f"unexpected call {method} {path}")
+        return fake_rest
+
+    def _commits_calls(self, m_rest):
+        return [c for c in m_rest.call_args_list
+                if c.args[1].startswith(self.COMMITS_PREFIX)
+                and c.args[1].endswith(self.COMMITS_SUFFIX)]
+
+    def test_runs_cycles_with_trailer_at_end_of_message(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(0)), \
+                mock.patch.object(ga, "pr_cycle",
+                                  return_value=42) as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_pair_extraordinaire(
+                client, "octocat", "achievement", self.COAUTHOR, 10)
+        self.assertEqual(result, 10)
+        self.assertEqual(m_cycle.call_count, 10)
+        for call in m_cycle.call_args_list:
+            self.assertEqual(call.args[1:3], ("octocat", "achievement"))
+            message = call.args[4]
+            self.assertTrue(message.endswith("\n\n" + self.TRAILER),
+                            msg=f"message lacks trailer: {message!r}")
+
+    def test_target_already_reached_runs_zero_cycles(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(10)), \
+                mock.patch.object(ga, "pr_cycle") as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_pair_extraordinaire(
+                client, "octocat", "achievement", self.COAUTHOR, 10)
+        self.assertEqual(result, 0)
+        m_cycle.assert_not_called()
+
+    def test_plain_merged_prs_do_not_count_toward_progress(self):
+        """3 co-authored + 4 plain merged PRs -> only 3 count; the badge
+        runs 7 more cycles for target 10."""
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(3, plain=4)), \
+                mock.patch.object(ga, "pr_cycle",
+                                  return_value=42) as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_pair_extraordinaire(
+                client, "octocat", "achievement", self.COAUTHOR, 10)
+        self.assertEqual(result, 7)
+        self.assertEqual(m_cycle.call_count, 7)
+
+    def test_commit_scan_is_bounded_to_50_merged_prs(self):
+        """Only the first 50 merged PRs get their commits fetched."""
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(60)) as m_rest, \
+                mock.patch.object(ga, "pr_cycle") as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_pair_extraordinaire(
+                client, "octocat", "achievement", self.COAUTHOR, 10)
+        self.assertEqual(result, 0)
+        m_cycle.assert_not_called()
+        self.assertEqual(len(self._commits_calls(m_rest)), 50)
+
+    def test_invalid_coauthor_fails_before_any_api_call(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(client, "rest") as m_rest, \
+                mock.patch.object(ga, "pr_cycle") as m_cycle:
+            with self.assertRaises(ValueError) as cm:
+                ga.badge_pair_extraordinaire(
+                    client, "octocat", "achievement", "Ada", 10)
+        self.assertIn('--coauthor "Name <email>"', str(cm.exception))
+        m_rest.assert_not_called()
+        m_cycle.assert_not_called()
 
 
 class InterfaceTests(unittest.TestCase):
