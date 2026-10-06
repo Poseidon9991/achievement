@@ -557,6 +557,31 @@ class PublishTests(ClientTestCase):
         self.assertEqual(cm.exception.status, 500)
         m_run.assert_not_called()
 
+    def test_existing_fork_rejected_without_writes(self):
+        """An existing repo that is a fork is rejected — the playground
+        must be standalone; no POST and no git push may happen."""
+        client = ga.GitHubClient("tok", delay=0)
+        posts = []
+
+        def fake_rest(method, path, body=None):
+            if method == "POST":
+                posts.append((path, body))
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == "/repos/octocat/achievement":
+                return {"name": "achievement", "fork": True,
+                        "full_name": "octocat/achievement"}
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest), \
+                mock.patch("subprocess.run") as m_run:
+            with self.assertRaises(ga.GHError) as cm:
+                ga.cmd_publish(client, "achievement")
+        self.assertIn("fork", str(cm.exception))
+        self.assertIn("standalone", str(cm.exception))
+        self.assertEqual(posts, [])
+        m_run.assert_not_called()
+
     def test_existing_origin_falls_back_to_set_url(self):
         """Re-running publish when origin is already configured: the failed
         `git remote add` is tolerated and `git remote set-url` repoints it."""
@@ -594,6 +619,12 @@ class PublishTests(ClientTestCase):
         out = buf.getvalue()
         self.assertIn("DRY-RUN", out)
         self.assertIn("git push -u origin main", out)
+        # dry-run cannot know whether the repo exists (GET returns {}), so
+        # the plan shows the conditional create instead of asserting state
+        self.assertIn("DRY-RUN (if 404) POST /user/repos", out)
+        self.assertIn('"private": false', out)
+        self.assertIn('"auto_init": false', out)
+        self.assertNotIn("already exists", out)
         self.assertFalse(result["created"])
 
 

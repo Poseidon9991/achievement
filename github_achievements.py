@@ -452,12 +452,16 @@ def cmd_publish(client: GitHubClient, name: str) -> dict:
     ``GET /repos/{login}/{name}`` decides whether the repo already exists;
     a 404 triggers ``POST /user/repos`` with
     ``{"name": name, "private": False, "auto_init": False}``. Any other
-    ``GHError`` propagates to the caller. Both paths then run
-    ``git remote add origin https://github.com/{login}/{name}.git`` and
-    ``git push -u origin main`` via ``_run_git`` — so re-running publish on
-    an existing repo simply pushes again (idempotent). A failed
-    ``remote add`` (origin already configured) falls back to
-    ``git remote set-url`` so the remote is repointed rather than fatal.
+    ``GHError`` propagates to the caller. An existing repo that is a fork
+    is rejected with ``GHError`` — the playground must be standalone.
+    Otherwise both paths run ``git remote add origin
+    https://github.com/{login}/{name}.git`` and ``git push -u origin main``
+    via ``_run_git`` — so re-running publish on an existing repo simply
+    pushes again (idempotent). A failed ``remote add`` (origin already
+    configured) falls back to ``git remote set-url`` so the remote is
+    repointed rather than fatal. In dry-run mode the repo's existence is
+    unknown (dry-run GETs return ``{}``), so the plan prints the
+    conditional create step instead of claiming either state.
 
     Returns ``{"name", "owner", "full_name", "html_url", "remote_url",
     "created", "pushed"}`` — ``pushed`` is False when the push exited
@@ -486,9 +490,27 @@ def cmd_publish(client: GitHubClient, name: str) -> dict:
         created = True
         print(f"Created {login}/{name}.")
     else:
-        print(f"Repo {login}/{name} already exists; skipping creation.")
-    client.log(f"publish: repo {login}/{name} "
-               f"{'created' if created else 'already existed'}")
+        if repo.get("fork"):
+            raise GHError(
+                0, f"{login}/{name} is a fork; the playground repo must "
+                   "be standalone")
+        if client.dry_run:
+            # dry-run GETs return {}, so existence is unknown — show the
+            # conditional create step rather than asserting either state
+            body = {"name": name,
+                    "private": False,
+                    "auto_init": False}
+            line = (f"DRY-RUN (if 404) POST /user/repos "
+                    f"body={json.dumps(body)}")
+            print(line)
+            client.log(line)
+        else:
+            print(f"Repo {login}/{name} already exists; skipping creation.")
+    if client.dry_run:
+        client.log(f"publish: {login}/{name} existence unknown (dry-run)")
+    else:
+        client.log(f"publish: repo {login}/{name} "
+                   f"{'created' if created else 'already existed'}")
     if not _run_git(client, ["remote", "add", "origin", remote_url]):
         _run_git(client, ["remote", "set-url", "origin", remote_url])
     pushed = _run_git(client, ["push", "-u", "origin", "main"])
