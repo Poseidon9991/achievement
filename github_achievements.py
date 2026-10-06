@@ -7,6 +7,8 @@ an activity log that never writes the token, and shared constants/helpers
 (``TIER_TARGETS``, ``format_coauthor_trailer``) used by the badge tasks.
 Task 2 adds ``cmd_doctor`` (token health check) and ``cmd_status`` (scrapes
 the public profile page for earned achievements via ``parse_profile_badges``).
+Task 3 adds ``cmd_publish`` (create-or-reuse the playground repo, add the
+``origin`` remote, and push ``main``).
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -405,3 +408,101 @@ def cmd_status(client: GitHubClient) -> None:
         print(f"{name:<{name_w}}  {str(target):<8}  {mark}")
     client.log(f"status: {login} earned="
                f"{','.join(sorted(earned)) or 'none'}")
+
+
+def _run_git(client: GitHubClient, args: list[str]) -> bool:
+    """Run ``git *args``, echoing and logging captured output.
+
+    Uses ``subprocess.run(check=False, capture_output=True, text=True)``:
+    git failures are reported, never raised — the caller decides how to
+    react via the returned boolean (True on exit code 0). In dry-run mode
+    the command line is printed/logged as ``DRY-RUN git ...`` and nothing
+    is executed.
+    """
+    cmdline = "git " + " ".join(args)
+    if client.dry_run:
+        line = f"DRY-RUN {cmdline}"
+        print(line)
+        client.log(line)
+        return True
+    try:
+        result = subprocess.run(["git", *args], check=False,
+                                capture_output=True, text=True)
+    except OSError as exc:
+        # git not on PATH, etc. — same contract as a non-zero exit
+        print(f"{cmdline}: could not run git: {exc}", file=sys.stderr)
+        client.log(f"{cmdline} -> failed to start: {exc}")
+        return False
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if stdout:
+        print(stdout)
+        client.log(f"{cmdline} stdout: {stdout}")
+    if stderr:
+        print(stderr, file=sys.stderr)
+        client.log(f"{cmdline} stderr: {stderr}")
+    client.log(f"{cmdline} -> exit {result.returncode}")
+    return result.returncode == 0
+
+
+def cmd_publish(client: GitHubClient, name: str) -> dict:
+    """Ensure ``{login}/{name}`` exists on GitHub and push ``main`` to it.
+
+    The login is resolved from ``GET /user`` at runtime (never hardcoded).
+    ``GET /repos/{login}/{name}`` decides whether the repo already exists;
+    a 404 triggers ``POST /user/repos`` with
+    ``{"name": name, "private": False, "auto_init": False}``. Any other
+    ``GHError`` propagates to the caller. Both paths then run
+    ``git remote add origin https://github.com/{login}/{name}.git`` and
+    ``git push -u origin main`` via ``_run_git`` — so re-running publish on
+    an existing repo simply pushes again (idempotent). A failed
+    ``remote add`` (origin already configured) falls back to
+    ``git remote set-url`` so the remote is repointed rather than fatal.
+
+    Returns ``{"name", "owner", "full_name", "html_url", "remote_url",
+    "created", "pushed"}`` — ``pushed`` is False when the push exited
+    non-zero (the failure is logged, not raised).
+    """
+    user = client.rest("GET", "/user")
+    login = user.get("login")
+    if not login:
+        if client.dry_run:
+            login = "<login>"  # dry-run GETs return {}; keep printing plan
+        else:
+            raise GHError(
+                0, "could not resolve the authenticated user's login")
+    remote_url = f"https://github.com/{login}/{name}.git"
+    created = False
+    try:
+        repo = client.rest("GET", f"/repos/{login}/{name}")
+    except GHError as exc:
+        if exc.status != 404:
+            raise
+        print(f"Repo {login}/{name} not found; creating it.")
+        repo = client.rest("POST", "/user/repos",
+                           {"name": name,
+                            "private": False,
+                            "auto_init": False})
+        created = True
+        print(f"Created {login}/{name}.")
+    else:
+        print(f"Repo {login}/{name} already exists; skipping creation.")
+    client.log(f"publish: repo {login}/{name} "
+               f"{'created' if created else 'already existed'}")
+    if not _run_git(client, ["remote", "add", "origin", remote_url]):
+        _run_git(client, ["remote", "set-url", "origin", remote_url])
+    pushed = _run_git(client, ["push", "-u", "origin", "main"])
+    if not pushed:
+        print(f"git push to {remote_url} failed; see {LOG_PATH} for details.",
+              file=sys.stderr)
+    html_url = (repo.get("html_url") if isinstance(repo, dict) else None) \
+        or f"https://github.com/{login}/{name}"
+    return {
+        "name": name,
+        "owner": login,
+        "full_name": f"{login}/{name}",
+        "html_url": html_url,
+        "remote_url": remote_url,
+        "created": created,
+        "pushed": pushed,
+    }

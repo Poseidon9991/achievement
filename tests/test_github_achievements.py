@@ -1,12 +1,13 @@
-"""Tests for github_achievements.py — Tasks 1-2.
+"""Tests for github_achievements.py — Tasks 1-3.
 
 Task 1: client core + token loading. Task 2: doctor/status commands and
-profile badge parsing.
+profile badge parsing. Task 3: publish command (repo creation + git push).
 """
 
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -448,6 +449,152 @@ class StatusTests(ClientTestCase):
         # retired event badges are not part of the earnable table
         self.assertNotIn("Arctic Code Vault", out)
         self.assertNotIn("Mars 2020", out)
+
+
+class PublishTests(ClientTestCase):
+    """cmd_publish: create-or-reuse the playground repo, add origin, push."""
+
+    def _completed(self, stdout="", stderr="", rc=0):
+        return subprocess.CompletedProcess(
+            args=["git"], returncode=rc, stdout=stdout, stderr=stderr)
+
+    def _git_commands(self, m_run):
+        return [call.args[0] for call in m_run.call_args_list]
+
+    def test_existing_repo_skips_post_and_pushes(self):
+        client = ga.GitHubClient("tok", delay=0)
+        posts = []
+
+        def fake_rest(method, path, body=None):
+            if method == "POST":
+                posts.append((path, body))
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == "/repos/octocat/achievement":
+                return {"name": "achievement",
+                        "full_name": "octocat/achievement",
+                        "html_url": "https://github.com/octocat/achievement"}
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest), \
+                mock.patch("subprocess.run") as m_run:
+            m_run.return_value = self._completed(
+                stdout="Everything up-to-date")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                result = ga.cmd_publish(client, "achievement")
+        # repo already exists -> no POST /user/repos (idempotent)
+        self.assertEqual(posts, [])
+        commands = self._git_commands(m_run)
+        self.assertIn(["git", "remote", "add", "origin",
+                       "https://github.com/octocat/achievement.git"],
+                      commands)
+        self.assertIn(["git", "push", "-u", "origin", "main"], commands)
+        # git was invoked non-fatally with captured output
+        for call in m_run.call_args_list:
+            self.assertEqual(call.kwargs.get("check"), False)
+            self.assertTrue(call.kwargs.get("capture_output"))
+        self.assertFalse(result["created"])
+        self.assertTrue(result["pushed"])
+        self.assertEqual(result["full_name"], "octocat/achievement")
+        self.assertEqual(result["html_url"],
+                         "https://github.com/octocat/achievement")
+        # git stdout is echoed and recorded in the activity log
+        self.assertIn("Everything up-to-date", buf.getvalue())
+        self.assertIn("Everything up-to-date", self.read_log())
+
+    def test_missing_repo_creates_then_pushes(self):
+        client = ga.GitHubClient("tok", delay=0)
+
+        def fake_rest(method, path, body=None):
+            if path == "/user":
+                return {"login": "octocat"}
+            if method == "GET" and path == "/repos/octocat/achievement":
+                raise ga.GHError(404, "Not Found")
+            if method == "POST" and path == "/user/repos":
+                return {"name": "achievement",
+                        "full_name": "octocat/achievement",
+                        "html_url": "https://github.com/octocat/achievement"}
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest) as m_rest, \
+                mock.patch("subprocess.run") as m_run:
+            m_run.return_value = self._completed(stdout="branch 'main' set up")
+            with redirect_stdout(io.StringIO()):
+                result = ga.cmd_publish(client, "achievement")
+        post_calls = [c for c in m_rest.call_args_list
+                      if c.args[0] == "POST"]
+        self.assertEqual(len(post_calls), 1)
+        self.assertEqual(post_calls[0].args[1], "/user/repos")
+        self.assertEqual(post_calls[0].args[2],
+                         {"name": "achievement",
+                          "private": False,
+                          "auto_init": False})
+        commands = self._git_commands(m_run)
+        # remote add runs before the push
+        self.assertEqual(commands[0],
+                         ["git", "remote", "add", "origin",
+                          "https://github.com/octocat/achievement.git"])
+        self.assertEqual(commands[-1],
+                         ["git", "push", "-u", "origin", "main"])
+        self.assertTrue(result["created"])
+        self.assertTrue(result["pushed"])
+        self.assertEqual(result["remote_url"],
+                         "https://github.com/octocat/achievement.git")
+
+    def test_repo_lookup_non404_error_propagates(self):
+        client = ga.GitHubClient("tok", delay=0)
+
+        def fake_rest(method, path, body=None):
+            if path == "/user":
+                return {"login": "octocat"}
+            raise ga.GHError(500, "server exploded")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest), \
+                mock.patch("subprocess.run") as m_run:
+            with self.assertRaises(ga.GHError) as cm:
+                ga.cmd_publish(client, "achievement")
+        self.assertEqual(cm.exception.status, 500)
+        m_run.assert_not_called()
+
+    def test_existing_origin_falls_back_to_set_url(self):
+        """Re-running publish when origin is already configured: the failed
+        `git remote add` is tolerated and `git remote set-url` repoints it."""
+        client = ga.GitHubClient("tok", delay=0)
+
+        def fake_rest(method, path, body=None):
+            if path == "/user":
+                return {"login": "octocat"}
+            return {"name": "achievement"}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[1:3] == ["remote", "add"]:
+                return self._completed(
+                    rc=3, stderr="error: remote origin already exists.")
+            return self._completed(stdout="ok")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest), \
+                mock.patch("subprocess.run", side_effect=fake_run) as m_run:
+            with redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()):
+                result = ga.cmd_publish(client, "achievement")
+        commands = self._git_commands(m_run)
+        self.assertIn(["git", "remote", "set-url", "origin",
+                       "https://github.com/octocat/achievement.git"],
+                      commands)
+        self.assertIn(["git", "push", "-u", "origin", "main"], commands)
+        self.assertTrue(result["pushed"])
+
+    def test_dry_run_prints_plan_without_running_git(self):
+        client = ga.GitHubClient("tok", dry_run=True, delay=0)
+        buf = io.StringIO()
+        with mock.patch("subprocess.run") as m_run, redirect_stdout(buf):
+            result = ga.cmd_publish(client, "achievement")
+        m_run.assert_not_called()
+        out = buf.getvalue()
+        self.assertIn("DRY-RUN", out)
+        self.assertIn("git push -u origin main", out)
+        self.assertFalse(result["created"])
 
 
 class InterfaceTests(unittest.TestCase):
