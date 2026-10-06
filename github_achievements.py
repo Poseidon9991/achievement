@@ -70,9 +70,32 @@ STATUS_BADGE_TARGETS = {
     "Open Sourcerer": "n/a",
 }
 
+# Achievement slug -> display name. Slugs appear in profile-page hrefs as
+# `{profile}?achievement=<slug>&tab=achievements` — a URL pattern unique to
+# GitHub's own achievements section.
+SLUG_TO_NAME = {
+    "quickdraw": "Quickdraw",
+    "pull-shark": "Pull Shark",
+    "galaxy-brain": "Galaxy Brain",
+    "yolo": "YOLO",
+    "pair-extraordinaire": "Pair Extraordinaire",
+    "starstruck": "Starstruck",
+    "public-sponsor": "Public Sponsor",
+    "arctic-code-vault-contributor": "Arctic Code Vault Contributor",
+    "mars-2020-helicopter-contributor": "Mars 2020 Contributor",
+    "heart-on-your-sleeve": "Heart On Your Sleeve",
+    "open-sourcerer": "Open Sourcerer",
+}
+
+_ACHIEVEMENT_SLUG_RE = re.compile(
+    r"""href\s*=\s*["'][^"']*[?&]achievement=([a-zA-Z0-9-]+)""",
+    re.IGNORECASE)
 _BADGE_ATTR_RE = re.compile(
     r"""(?:alt|aria-label)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 _ACHIEVEMENT_PREFIX_RE = re.compile(r"^\s*achievement\s*:\s*", re.IGNORECASE)
+_TIER_SUFFIX_RE = re.compile(r"\s+x\d+$", re.IGNORECASE)
+_ACHIEVEMENTS_SECTION_MARK = "Achievements"
+_KNOWN_BADGES_FOLDED = {name.casefold(): name for name in KNOWN_BADGES}
 
 
 class GHError(Exception):
@@ -250,22 +273,47 @@ class GitHubClient:
         return data if isinstance(data, dict) else result
 
 
+def _canonical_badge_name(raw: str) -> str | None:
+    """Normalize an extracted badge label to its canonical display name.
+
+    Strips an ``"Achievement: "`` prefix and a tier suffix like ``" x3"``,
+    then matches case-insensitively against the known-badge allowlist.
+    Returns ``None`` for anything unrecognized.
+    """
+    name = _ACHIEVEMENT_PREFIX_RE.sub("", raw).strip()
+    name = _TIER_SUFFIX_RE.sub("", name).strip()
+    return _KNOWN_BADGES_FOLDED.get(name.casefold())
+
+
 def parse_profile_badges(html: str) -> list[str]:
     """Extract achievement names from a GitHub profile page's achievements
     section.
 
-    Badge names appear in ``alt``/``aria-label`` attributes in that section,
-    sometimes prefixed with ``"Achievement: "`` (e.g. ``alt="Quickdraw"``,
-    ``aria-label="Achievement: YOLO"``). Unknown attribute values are
-    ignored; a profile with zero badges returns ``[]``. Results are deduped
+    Primary extraction matches ``achievement=<slug>`` inside href values —
+    the ``?achievement=...&tab=achievements`` URL pattern is unique to
+    GitHub's own achievements section, so it is safe page-wide. Only when
+    no slug matches does the fallback run: the HTML is sliced starting at
+    the ``Achievements`` heading and badge ``alt``/``aria-label`` values
+    are matched inside that slice alone (README content elsewhere on the
+    page could otherwise spoof badge alt text). No achievements section
+    means ``[]`` — the whole document is never scanned. Results are deduped
     in first-seen (document) order.
     """
-    known = set(KNOWN_BADGES)
     earned: list[str] = []
-    for match in _BADGE_ATTR_RE.finditer(html):
-        name = _ACHIEVEMENT_PREFIX_RE.sub("", match.group(1)).strip()
-        if name in known and name not in earned:
+
+    def _add(name: str | None) -> None:
+        if name and name not in earned:
             earned.append(name)
+
+    for match in _ACHIEVEMENT_SLUG_RE.finditer(html):
+        _add(SLUG_TO_NAME.get(match.group(1).lower()))
+
+    if not earned:
+        section = html.find(_ACHIEVEMENTS_SECTION_MARK)
+        if section == -1:
+            return []
+        for match in _BADGE_ATTR_RE.finditer(html[section:]):
+            _add(_canonical_badge_name(match.group(1)))
     return earned
 
 

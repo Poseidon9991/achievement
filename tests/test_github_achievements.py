@@ -77,6 +77,22 @@ PROFILE_HTML_NO_BADGES = """
 </body></html>
 """
 
+# Fixture: a profile README can carry badge-looking alt text
+# (`![Pull Shark](img.png)` renders <img alt="Pull Shark">). Only the real
+# `?achievement=` href in the achievements section may count — the stray
+# img must not produce a false positive.
+PROFILE_HTML_STRAY_README_IMG = """
+<div class="readme">
+  <img src="img.png" alt="Pull Shark">
+</div>
+<div class="border-top color-border-muted pt-3 mt-3 d-none d-md-block">
+  <h2 class="h4 mb-2">Achievements</h2>
+  <a href="/octocat?achievement=quickdraw&tab=achievements">
+    <img src="quickdraw.png" alt="Quickdraw" width="64" height="64">
+  </a>
+</div>
+"""
+
 
 class LoadTokenTests(unittest.TestCase):
     def test_cli_token_wins_over_everything(self):
@@ -334,10 +350,29 @@ class ParseProfileBadgesTests(unittest.TestCase):
         self.assertEqual(ga.parse_profile_badges(""), [])
 
     def test_ignores_unknown_alt_and_aria_labels(self):
-        html = ('<img src="a.png" alt="Not A Badge">'
+        html = ('<h2>Achievements</h2>'
+                '<img src="a.png" alt="Not A Badge">'
                 '<a aria-label="Sponsor octocat" href="#">x</a>'
                 '<img src="b.png" alt="Starstruck">')
         self.assertEqual(ga.parse_profile_badges(html), ["Starstruck"])
+
+    def test_stray_readme_img_is_not_a_false_positive(self):
+        self.assertEqual(
+            ga.parse_profile_badges(PROFILE_HTML_STRAY_README_IMG),
+            ["Quickdraw"],
+        )
+
+    def test_no_achievements_section_never_scans_document(self):
+        html = ('<div class="readme">'
+                '<img src="i.png" alt="Pull Shark"></div>')
+        self.assertEqual(ga.parse_profile_badges(html), [])
+
+    def test_tier_suffix_and_casing_match_allowlist(self):
+        html = ('<h2>Achievements</h2>'
+                '<img src="a.png" alt="Pull Shark x3">'
+                '<a aria-label="quickdraw" href="#">x</a>')
+        self.assertEqual(ga.parse_profile_badges(html),
+                         ["Pull Shark", "Quickdraw"])
 
 
 class DoctorTests(ClientTestCase):
