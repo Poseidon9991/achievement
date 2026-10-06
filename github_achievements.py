@@ -95,6 +95,18 @@ _BADGE_ATTR_RE = re.compile(
 _ACHIEVEMENT_PREFIX_RE = re.compile(r"^\s*achievement\s*:\s*", re.IGNORECASE)
 _TIER_SUFFIX_RE = re.compile(r"\s+x\d+$", re.IGNORECASE)
 _ACHIEVEMENTS_SECTION_MARK = "Achievements"
+# Sections that render below Achievements on a profile page; the fallback
+# slice ends at the earliest one so badge-looking alt text in later content
+# (README, footer, orgs) cannot false-positive.
+_POST_ACHIEVEMENTS_LANDMARKS = (
+    "Contribution activity",
+    "Organizations",
+    "Popular repositories",
+    "Public contributions",
+)
+# Upper bound when no landmark is found — generous for ~a dozen badges'
+# worth of section markup.
+_ACHIEVEMENTS_WINDOW = 30_000
 _KNOWN_BADGES_FOLDED = {name.casefold(): name for name in KNOWN_BADGES}
 
 
@@ -292,12 +304,13 @@ def parse_profile_badges(html: str) -> list[str]:
     Primary extraction matches ``achievement=<slug>`` inside href values —
     the ``?achievement=...&tab=achievements`` URL pattern is unique to
     GitHub's own achievements section, so it is safe page-wide. Only when
-    no slug matches does the fallback run: the HTML is sliced starting at
-    the ``Achievements`` heading and badge ``alt``/``aria-label`` values
-    are matched inside that slice alone (README content elsewhere on the
-    page could otherwise spoof badge alt text). No achievements section
-    means ``[]`` — the whole document is never scanned. Results are deduped
-    in first-seen (document) order.
+    no slug matches does the fallback run: the HTML is sliced from the
+    ``Achievements`` heading to the earliest post-section landmark (or a
+    fixed window), and badge ``alt``/``aria-label`` values are matched
+    inside that slice alone (README content elsewhere on the page could
+    otherwise spoof badge alt text). No achievements section means ``[]``
+    — the whole document is never scanned. Results are deduped in
+    first-seen (document) order.
     """
     earned: list[str] = []
 
@@ -312,7 +325,15 @@ def parse_profile_badges(html: str) -> list[str]:
         section = html.find(_ACHIEVEMENTS_SECTION_MARK)
         if section == -1:
             return []
-        for match in _BADGE_ATTR_RE.finditer(html[section:]):
+        # Bound the slice on both ends: start at the Achievements heading,
+        # end at the earliest post-section landmark (or the fixed window).
+        end = section + _ACHIEVEMENTS_WINDOW
+        after_mark = section + len(_ACHIEVEMENTS_SECTION_MARK)
+        for landmark in _POST_ACHIEVEMENTS_LANDMARKS:
+            idx = html.find(landmark, after_mark)
+            if idx != -1:
+                end = min(end, idx)
+        for match in _BADGE_ATTR_RE.finditer(html[section:end]):
             _add(_canonical_badge_name(match.group(1)))
     return earned
 

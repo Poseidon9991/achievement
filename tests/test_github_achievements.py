@@ -93,6 +93,21 @@ PROFILE_HTML_STRAY_README_IMG = """
 </div>
 """
 
+# Fixture: no `?achievement=` hrefs, so the alt/aria-label fallback runs.
+# A real badge sits inside the achievements section; a stray badge-looking
+# img appears AFTER it, past the next section's landmark — the bounded
+# slice must exclude it.
+PROFILE_HTML_STRAY_AFTER_SECTION = """
+<div class="border-top color-border-muted pt-3 mt-3 d-none d-md-block">
+  <h2 class="h4 mb-2">Achievements</h2>
+  <img src="yolo.png" alt="YOLO" width="64" height="64">
+</div>
+<div class="border-top color-border-muted pt-3 mt-3">
+  <h2 class="h4 mb-2">Contribution activity</h2>
+  <div class="readme-footer"><img src="s.png" alt="Starstruck"></div>
+</div>
+"""
+
 
 class LoadTokenTests(unittest.TestCase):
     def test_cli_token_wins_over_everything(self):
@@ -360,6 +375,12 @@ class ParseProfileBadgesTests(unittest.TestCase):
         self.assertEqual(
             ga.parse_profile_badges(PROFILE_HTML_STRAY_README_IMG),
             ["Quickdraw"],
+        )
+
+    def test_fallback_slice_stops_at_next_section(self):
+        self.assertEqual(
+            ga.parse_profile_badges(PROFILE_HTML_STRAY_AFTER_SECTION),
+            ["YOLO"],
         )
 
     def test_no_achievements_section_never_scans_document(self):
