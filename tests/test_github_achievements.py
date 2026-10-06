@@ -1,9 +1,12 @@
-"""Tests for github_achievements.py — Tasks 1-3.
+"""Tests for github_achievements.py — Tasks 1-4.
 
 Task 1: client core + token loading. Task 2: doctor/status commands and
 profile badge parsing. Task 3: publish command (repo creation + git push).
+Task 4: PR engine (pr_cycle, count_merged_prs) plus the quickdraw, yolo,
+and pull-shark badge drivers.
 """
 
+import base64
 import io
 import json
 import os
@@ -626,6 +629,269 @@ class PublishTests(ClientTestCase):
         self.assertIn('"auto_init": false', out)
         self.assertNotIn("already exists", out)
         self.assertFalse(result["created"])
+
+
+class CountMergedPrsTests(ClientTestCase):
+    """count_merged_prs: closed PRs with non-null merged_at authored by
+    the authenticated user."""
+
+    PULLS_PATH = "/repos/octocat/achievement/pulls?state=closed&per_page=100"
+
+    def _pulls(self, *entries):
+        return [{"number": i + 1, "merged_at": merged,
+                 "user": {"login": login}}
+                for i, (merged, login) in enumerate(entries)]
+
+    def test_two_merged_of_three_closed_returns_two(self):
+        client = ga.GitHubClient("tok", delay=0)
+        pulls = self._pulls(
+            ("2026-01-01T00:00:00Z", "octocat"),
+            (None, "octocat"),
+            ("2026-01-02T00:00:00Z", "octocat"),
+        )
+
+        def fake_rest(method, path, body=None):
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == self.PULLS_PATH:
+                return pulls
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest):
+            result = ga.count_merged_prs(client, "octocat", "achievement")
+        self.assertEqual(result, 2)
+
+    def test_merged_prs_by_other_authors_do_not_count(self):
+        client = ga.GitHubClient("tok", delay=0)
+        pulls = self._pulls(
+            ("2026-01-01T00:00:00Z", "octocat"),
+            ("2026-01-02T00:00:00Z", "someone-else"),
+        )
+
+        def fake_rest(method, path, body=None):
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == self.PULLS_PATH:
+                return pulls
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest):
+            result = ga.count_merged_prs(client, "octocat", "achievement")
+        self.assertEqual(result, 1)
+
+    def test_explicit_login_skips_user_fetch(self):
+        """Passing login avoids the extra GET /user (fetch once, reuse)."""
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+
+        def fake_rest(method, path, body=None):
+            calls.append(path)
+            if path == self.PULLS_PATH:
+                return self._pulls(("x", "octocat"), (None, "octocat"))
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest):
+            result = ga.count_merged_prs(client, "octocat", "achievement",
+                                         login="octocat")
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, [self.PULLS_PATH])
+
+    def test_empty_or_nonlist_response_returns_zero(self):
+        """Dry-run REST returns {}; anything that is not a list counts 0."""
+        client = ga.GitHubClient("tok", dry_run=True, delay=0)
+        with redirect_stdout(io.StringIO()):
+            result = ga.count_merged_prs(client, "o", "r", login="o")
+        self.assertEqual(result, 0)
+
+
+class PrCycleTests(ClientTestCase):
+    """pr_cycle: branch -> commit -> PR -> merge -> branch delete."""
+
+    def _fake_rest(self, calls, delete_fails=False):
+        def fake_rest(method, path, body=None):
+            calls.append((method, path, body))
+            if method == "GET" and path == "/repos/o/r":
+                return {"default_branch": "main"}
+            if method == "GET" and path == "/repos/o/r/git/refs/heads/main":
+                return {"object": {"sha": "abc123"}}
+            if method == "POST" and path == "/repos/o/r/pulls":
+                return {"number": 42}
+            if method == "DELETE" and delete_fails:
+                raise ga.GHError(422, "Reference does not exist")
+            return {}
+        return fake_rest
+
+    def test_five_mutating_calls_in_order_and_returns_pr_number(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(calls)):
+            number = ga.pr_cycle(client, "o", "r", "pull-shark-1",
+                                 "Pull Shark PR 1/16")
+        self.assertEqual(number, 42)
+        mutating = [(m, p) for m, p, _ in calls if m != "GET"]
+        self.assertEqual([m for m, _ in mutating],
+                         ["POST", "PUT", "POST", "PUT", "DELETE"])
+        self.assertEqual(mutating[0], ("POST", "/repos/o/r/git/refs"))
+        self.assertTrue(mutating[1][1].startswith(
+            "/repos/o/r/contents/notes/pull-shark-1"))
+        self.assertTrue(mutating[1][1].endswith(".md"))
+        self.assertEqual(mutating[2], ("POST", "/repos/o/r/pulls"))
+        self.assertEqual(mutating[3], ("PUT", "/repos/o/r/pulls/42/merge"))
+        self.assertTrue(mutating[4][1].startswith(
+            "/repos/o/r/git/refs/heads/shark-pr-"))
+
+    def test_request_bodies_match_api_contract(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(calls)):
+            ga.pr_cycle(client, "o", "r", "yolo", "YOLO: no review")
+
+        def body_for(method, path_pred):
+            return next(b for m, p, b in calls
+                        if m == method and path_pred(p))
+
+        ref_body = body_for("POST", lambda p: p == "/repos/o/r/git/refs")
+        self.assertEqual(ref_body["sha"], "abc123")
+        self.assertTrue(ref_body["ref"].startswith("refs/heads/shark-pr-"))
+        branch = ref_body["ref"].removeprefix("refs/heads/")
+
+        content_body = body_for("PUT", lambda p: "/contents/notes/" in p)
+        self.assertEqual(content_body["message"], "YOLO: no review")
+        self.assertEqual(content_body["branch"], branch)
+        decoded = base64.b64decode(content_body["content"]).decode("utf-8")
+        self.assertIn("YOLO: no review", decoded)
+
+        pulls_body = body_for("POST", lambda p: p == "/repos/o/r/pulls")
+        self.assertEqual(pulls_body["title"], "YOLO: no review")
+        self.assertEqual(pulls_body["head"], branch)
+        self.assertEqual(pulls_body["base"], "main")
+        self.assertIn("body", pulls_body)
+
+        merge_body = body_for("PUT", lambda p: p.endswith("/merge"))
+        self.assertEqual(merge_body, {"merge_method": "merge"})
+
+    def test_branch_delete_failure_is_tolerated(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+        with mock.patch.object(
+                client, "rest",
+                side_effect=self._fake_rest(calls, delete_fails=True)), \
+                redirect_stderr(io.StringIO()):
+            number = ga.pr_cycle(client, "o", "r", "x", "msg")
+        self.assertEqual(number, 42)
+        self.assertIn("delete", self.read_log())
+
+    def test_branches_are_unique_per_cycle(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(calls)):
+            ga.pr_cycle(client, "o", "r", "pull-shark", "a")
+            ga.pr_cycle(client, "o", "r", "pull-shark", "b")
+        refs = [b["ref"] for m, p, b in calls
+                if m == "POST" and p == "/repos/o/r/git/refs"]
+        self.assertEqual(len(set(refs)), 2)
+
+
+class QuickdrawTests(ClientTestCase):
+    """badge_quickdraw: open an issue, close it immediately."""
+
+    def test_opens_then_closes_issue_immediately(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls = []
+
+        def fake_rest(method, path, body=None):
+            calls.append((method, path, body))
+            if method == "POST" and path == "/repos/o/r/issues":
+                return {"number": 9}
+            return {}
+
+        with mock.patch.object(client, "rest", side_effect=fake_rest), \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_quickdraw(client, "o", "r")
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], "POST")
+        self.assertEqual(calls[0][1], "/repos/o/r/issues")
+        self.assertIn("Quickdraw", calls[0][2]["title"])
+        self.assertEqual(calls[1], ("PATCH", "/repos/o/r/issues/9",
+                                    {"state": "closed"}))
+
+    def test_api_failure_returns_false(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(
+                client, "rest",
+                side_effect=ga.GHError(403, "forbidden")), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(ga.badge_quickdraw(client, "o", "r"))
+
+
+class YoloTests(ClientTestCase):
+    """badge_yolo: a single pr_cycle merged with no review requested."""
+
+    def test_runs_one_pr_cycle_and_returns_true(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(ga, "pr_cycle", return_value=42) as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_yolo(client, "o", "r")
+        self.assertTrue(result)
+        m_cycle.assert_called_once()
+        args = m_cycle.call_args.args
+        self.assertEqual(args[:3], (client, "o", "r"))
+        self.assertIn("yolo", args[3])
+
+    def test_pr_cycle_failure_returns_false(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(
+                ga, "pr_cycle",
+                side_effect=ga.GHError(422, "merge failed")), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(ga.badge_yolo(client, "o", "r"))
+
+
+class PullSharkTests(ClientTestCase):
+    """badge_pull_shark: idempotent — only runs the cycles still needed."""
+
+    PULLS_PATH = "/repos/octocat/achievement/pulls?state=closed&per_page=100"
+
+    def _fake_rest(self, merged_count):
+        pulls = [{"number": i + 1, "merged_at": "x" if i < merged_count
+                  else None, "user": {"login": "octocat"}}
+                 for i in range(merged_count + 1)]
+
+        def fake_rest(method, path, body=None):
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == self.PULLS_PATH:
+                return pulls
+            raise AssertionError(f"unexpected call {method} {path}")
+        return fake_rest
+
+    def test_two_merged_target_sixteen_runs_fourteen_cycles(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(2)), \
+                mock.patch.object(ga, "pr_cycle", return_value=100) as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_pull_shark(client, "octocat", "achievement", 16)
+        self.assertEqual(m_cycle.call_count, 14)
+        self.assertEqual(result, 14)
+        # every cycle is labelled as a pull-shark PR on the same repo
+        for call in m_cycle.call_args_list:
+            self.assertEqual(call.args[1:3], ("octocat", "achievement"))
+            self.assertIn("pull-shark", call.args[3])
+
+    def test_already_at_target_runs_zero_cycles(self):
+        client = ga.GitHubClient("tok", delay=0)
+        with mock.patch.object(client, "rest",
+                               side_effect=self._fake_rest(16)), \
+                mock.patch.object(ga, "pr_cycle") as m_cycle, \
+                redirect_stdout(io.StringIO()):
+            result = ga.badge_pull_shark(client, "octocat", "achievement", 16)
+        m_cycle.assert_not_called()
+        self.assertEqual(result, 0)
 
 
 class InterfaceTests(unittest.TestCase):
