@@ -911,7 +911,7 @@ def badge_galaxy_brain(client: GitHubClient, owner: str, repo: str,
         client.graphql(
             "mutation($commentId:ID!){"
             " markDiscussionCommentAsAnswer(input:{id:$commentId}){"
-            "  comment{id isAnswer}"
+            "  discussion{id}"
             " }"
             "}",
             {"commentId": comment.get("id")})
