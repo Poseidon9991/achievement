@@ -17,10 +17,18 @@ Task 5 adds ``badge_galaxy_brain`` — Discussions Q&A over GraphQL
 with a clean fallback when GitHub disallows self-marking answers.
 Task 6 adds ``badge_pair_extraordinaire`` — merged PRs whose commits
 carry a ``Co-authored-by`` trailer, validated by ``parse_coauthor``.
+Task 7 wires everything together: ``main()`` with the subcommands
+``doctor|publish|status|unlock|manual``, the ``unlock`` orchestration
+(publish -> quickdraw -> yolo -> pull-shark -> galaxy-brain ->
+pair-extraordinaire, each failure caught and reported in a summary
+table), the ownership guard that restricts writes to repos you own,
+``--dry-run`` planning without a live client, and ``manual`` steps for
+the badges that cannot be automated.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -942,3 +950,314 @@ def badge_pair_extraordinaire(client: GitHubClient, owner: str, repo: str,
     client.log(f"pair_extraordinaire: {owner}/{repo} ran {done} "
                f"cycle(s) toward {target}")
     return done
+
+
+# ---------------------------------------------------------------------------
+# Task 7: CLI wiring — main(), unlock orchestration, manual steps.
+
+DEFAULT_REPO_NAME = "achievement"
+
+# ``--tier base`` runs one cycle per badge (kickstart progress); the
+# default ``--tier bronze`` runs every badge to its full Bronze target
+# from TIER_TARGETS.
+TIER_BASE_TARGETS = {slug: 1 for slug in TIER_TARGETS}
+
+
+def cmd_manual() -> int:
+    """Print the exact steps for the two badges that cannot be automated
+    and return 0. Public Sponsor needs a real $1 payment via
+    https://github.com/sponsors; Starstruck needs 16 stars from other
+    people (self-stars don't count)."""
+    print(
+        "Manual steps for the badges this tool cannot automate\n"
+        "\n"
+        "Public Sponsor (Bronze: sponsor 1 developer)\n"
+        "  1. Go to https://github.com/sponsors and pick any sponsorable\n"
+        "     developer (browse the directory, or open a profile that\n"
+        "     shows a Sponsor button).\n"
+        "  2. Complete a $1 sponsorship. This needs a real payment - a\n"
+        "     credit card or PayPal on file - there is no API-only path.\n"
+        "  3. The badge is awarded once the payment goes through.\n"
+        "\n"
+        "Starstruck (Bronze: 16 stars)\n"
+        "  1. Stars must come from OTHER people - starring your own repo\n"
+        "     does not count, and neither do second accounts you control\n"
+        "     (that violates GitHub's terms of service).\n"
+        "  2. Share your playground repo (the one this tool published)\n"
+        "     with friends, colleagues, or communities and ask them to\n"
+        "     star it.\n"
+        "  3. Once 16 different people have starred it, the badge is\n"
+        "     awarded automatically.\n"
+        "\n"
+        "Note: achievements may take up to 24-48 hours to render on your\n"
+        "profile after the qualifying activity.\n")
+    return 0
+
+
+def _resolve_repo_target(client: GitHubClient,
+                         repo_arg: str | None) -> tuple[str, str, str]:
+    """Resolve ``--repo`` into ``(login, owner, name)`` for a write command.
+
+    ``--repo`` accepts ``OWNER/NAME`` or a bare ``NAME`` (the authenticated
+    user's repo); the default is the playground repo
+    ``{login}/{DEFAULT_REPO_NAME}``.
+
+    Ownership guard — the "writes only against owned repos" rule: in live
+    mode the login is resolved via ``GET /user`` and the target repo is
+    fetched via ``GET /repos/{owner}/{name}`` to verify
+    ``owner.login == login``. A missing repo (404) is tolerated only when
+    the requested owner is the login (publish creates it there); a repo
+    owned by anyone else raises ``GHError`` before a single write runs.
+    In dry-run mode the network check is skipped and the ``OWNER/NAME``
+    format is trusted.
+
+    Raises ``GHError`` on an invalid argument or an ownership violation.
+    """
+    if repo_arg:
+        parts = repo_arg.split("/")
+        if len(parts) == 2 and all(part.strip() for part in parts):
+            owner, name = parts[0].strip(), parts[1].strip()
+        elif len(parts) == 1 and repo_arg.strip():
+            owner, name = None, repo_arg.strip()
+        else:
+            raise GHError(
+                0, f"invalid --repo {repo_arg!r}: expected OWNER/NAME "
+                   "(e.g. octocat/achievement) or a bare NAME")
+    else:
+        owner, name = None, DEFAULT_REPO_NAME
+    user = client.rest("GET", "/user")
+    login = user.get("login")
+    if not login:
+        if client.dry_run:
+            login = "<login>"  # dry-run GETs return {}; keep printing plan
+        else:
+            raise GHError(0, "could not resolve the authenticated user's "
+                            "login")
+    if owner is None:
+        owner = login
+    if not client.dry_run:
+        try:
+            info = client.rest("GET", f"/repos/{owner}/{name}")
+        except GHError as exc:
+            if exc.status == 404 and owner.casefold() == login.casefold():
+                info = None  # own repo, not created yet: publish creates it
+            else:
+                raise
+        else:
+            actual = (info.get("owner") or {}).get("login") or ""
+            if actual.casefold() != login.casefold():
+                raise GHError(
+                    0, f"{owner}/{name} is owned by {actual!r}, not by you "
+                       f"({login}); this tool only writes to repositories "
+                       "you own")
+    return login, owner, name
+
+
+def _cli_publish(client: GitHubClient,
+                 args: argparse.Namespace) -> int:
+    """``publish`` subcommand: resolve the target (ownership guard), then
+    create-or-reuse the playground repo and push ``main``. Returns 0 only
+    when the push succeeded."""
+    try:
+        _, _, name = _resolve_repo_target(client, args.repo)
+        info = cmd_publish(client, name)
+    except GHError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not info.get("pushed"):
+        return 1
+    print(f"publish: {info.get('full_name')} is ready at "
+          f"{info.get('html_url')}")
+    return 0
+
+
+def _cli_unlock(client: GitHubClient,
+                args: argparse.Namespace) -> int:
+    """``unlock`` subcommand: publish, then run every automatable badge
+    (quickdraw -> yolo -> pull-shark -> galaxy-brain ->
+    pair-extraordinaire).
+
+    Each step is wrapped so a ``GHError`` is reported without stopping the
+    others; a final summary table lists every step's status. Galaxy Brain
+    returning ``-1`` (self-marking blocked) is a WARNING, not a failure.
+    Without ``--coauthor``, Pair Extraordinaire is skipped with a notice
+    explaining how to pass it. Returns 1 when any step FAILED, else 0.
+    """
+    try:
+        login, owner, name = _resolve_repo_target(client, args.repo)
+    except GHError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    targets = (TIER_TARGETS if args.tier == "bronze"
+               else TIER_BASE_TARGETS)
+    plan = ["publish (setup)", "Quickdraw", "YOLO", "Pull Shark",
+            "Galaxy Brain"]
+    if args.coauthor:
+        plan.append("Pair Extraordinaire")
+    print(f"Unlock plan ({args.tier} tier) for {owner}/{name}:")
+    print("  " + " -> ".join(plan))
+    if client.dry_run:
+        print("  targets: " + ", ".join(
+            f"{slug}={targets[slug]}" for slug in TIER_TARGETS))
+
+    results: list[tuple[str, str, str]] = []  # (step, status, detail)
+
+    try:
+        info = cmd_publish(client, name)
+        if info.get("pushed"):
+            results.append(("publish", "OK",
+                            f"pushed {info.get('full_name')}"))
+        else:
+            results.append(("publish", "FAILED", "git push did not succeed"))
+    except GHError as exc:
+        results.append(("publish", "FAILED", str(exc)))
+        print(f"publish failed: {exc}", file=sys.stderr)
+
+    try:
+        if badge_quickdraw(client, owner, name):
+            results.append(("Quickdraw", "OK", "issue opened and closed"))
+        else:
+            results.append(("Quickdraw", "FAILED",
+                            "attempt failed (see messages above)"))
+    except GHError as exc:
+        results.append(("Quickdraw", "FAILED", str(exc)))
+        print(f"Quickdraw failed: {exc}", file=sys.stderr)
+
+    try:
+        if badge_yolo(client, owner, name):
+            results.append(("YOLO", "OK", "PR merged with no review"))
+        else:
+            results.append(("YOLO", "FAILED",
+                            "attempt failed (see messages above)"))
+    except GHError as exc:
+        results.append(("YOLO", "FAILED", str(exc)))
+        print(f"YOLO failed: {exc}", file=sys.stderr)
+
+    try:
+        done = badge_pull_shark(client, owner, name,
+                                targets["pull_shark"])
+        results.append(("Pull Shark", "OK",
+                        f"{done} PR cycle(s) this run"))
+    except GHError as exc:
+        results.append(("Pull Shark", "FAILED", str(exc)))
+        print(f"Pull Shark failed: {exc}", file=sys.stderr)
+
+    try:
+        done = badge_galaxy_brain(client, owner, name,
+                                  targets["galaxy_brain"])
+        if done == -1:
+            # self-mark blocked: not a failure — the fallback note printed
+            # by the badge explains the partner/manual path
+            results.append(("Galaxy Brain", "WARNING",
+                            "self-marking blocked; follow the fallback "
+                            "note printed above"))
+        else:
+            results.append(("Galaxy Brain", "OK",
+                            f"{done} answer(s) this run"))
+    except GHError as exc:
+        results.append(("Galaxy Brain", "FAILED", str(exc)))
+        print(f"Galaxy Brain failed: {exc}", file=sys.stderr)
+
+    if not args.coauthor:
+        print('Pair Extraordinaire: skipped - pass '
+              '--coauthor "Name <email>" to earn this badge.')
+        results.append(("Pair Extraordinaire", "SKIPPED",
+                        'needs --coauthor "Name <email>"'))
+    else:
+        try:
+            done = badge_pair_extraordinaire(
+                client, owner, name, args.coauthor,
+                targets["pair_extraordinaire"])
+            results.append(("Pair Extraordinaire", "OK",
+                            f"{done} PR cycle(s) this run"))
+        except (GHError, ValueError) as exc:
+            results.append(("Pair Extraordinaire", "FAILED", str(exc)))
+            print(f"Pair Extraordinaire failed: {exc}", file=sys.stderr)
+
+    width = max(len(step) for step, _, _ in results)
+    print("\nUnlock summary:")
+    print(f"{'Step':<{width}}  {'Status':<8}  Detail")
+    print("-" * (width + 40))
+    for step, status, detail in results:
+        print(f"{step:<{width}}  {status:<8}  {detail}")
+    failed = [step for step, status, _ in results if status == "FAILED"]
+    if failed:
+        print(f"\n{len(failed)} step(s) failed: "
+              + ", ".join(failed), file=sys.stderr)
+        return 1
+    print("\nAll steps succeeded. Achievements may take up to 24-48h to "
+          "render on your profile (check with `status`).")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Returns the process exit code."""
+    parser = argparse.ArgumentParser(
+        prog="github_achievements",
+        description="Earn GitHub profile achievements on your own repos.")
+    sub = parser.add_subparsers(
+        dest="command", required=True,
+        metavar="{doctor,publish,status,unlock,manual}")
+
+    token_help = ("GitHub personal access token (default: the "
+                  "GITHUB_TOKEN environment variable or a .env file)")
+
+    p = sub.add_parser("doctor", help="check token health via GET /user")
+    p.add_argument("--token", help=token_help)
+
+    p = sub.add_parser(
+        "publish", help=f"create-or-reuse the playground repo "
+                        f"(default <login>/{DEFAULT_REPO_NAME}) and push "
+                        "main")
+    p.add_argument("--token", help=token_help)
+    p.add_argument("--repo", metavar="OWNER/NAME",
+                   help="target repo, OWNER/NAME or bare NAME "
+                        f"(default <login>/{DEFAULT_REPO_NAME})")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the plan without making any changes")
+
+    p = sub.add_parser("status",
+                       help="show earned achievements vs targets")
+    p.add_argument("--token", help=token_help)
+
+    p = sub.add_parser(
+        "unlock", help="run every automatable badge in order")
+    p.add_argument("--token", help=token_help)
+    p.add_argument("--repo", metavar="OWNER/NAME",
+                   help="target repo, OWNER/NAME or bare NAME "
+                        f"(default <login>/{DEFAULT_REPO_NAME})")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print each badge's exact call plan (paths and "
+                        "counts) without any writes")
+    p.add_argument("--tier", choices=("base", "bronze"), default="bronze",
+                   help="base: one cycle per badge; bronze: full Bronze "
+                        "targets (default)")
+    p.add_argument("--coauthor", metavar='"Name <email>"',
+                   help='co-author for Pair Extraordinaire, e.g. '
+                        '"Ada Lovelace <ada@x.io>" (omit to skip that '
+                        "badge)")
+
+    sub.add_parser("manual", help="manual steps for Public Sponsor and "
+                                  "Starstruck")
+
+    args = parser.parse_args(argv)
+    if args.command == "manual":
+        return cmd_manual()
+    token = load_token(args.token)
+    # dry-run constructs only the dry-run client — a live, writing client
+    # is never instantiated when --dry-run is passed
+    client = GitHubClient(token, dry_run=bool(getattr(args, "dry_run",
+                                                      False)))
+    if args.command == "doctor":
+        cmd_doctor(client)
+        return 0
+    if args.command == "status":
+        cmd_status(client)
+        return 0
+    if args.command == "publish":
+        return _cli_publish(client, args)
+    return _cli_unlock(client, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

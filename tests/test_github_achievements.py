@@ -1,4 +1,4 @@
-"""Tests for github_achievements.py — Tasks 1-6.
+"""Tests for github_achievements.py — Tasks 1-7.
 
 Task 1: client core + token loading. Task 2: doctor/status commands and
 profile badge parsing. Task 3: publish command (repo creation + git push).
@@ -6,7 +6,10 @@ Task 4: PR engine (pr_cycle, count_merged_prs) plus the quickdraw, yolo,
 and pull-shark badge drivers. Task 5: badge_galaxy_brain — Discussions
 Q&A with a self-mark-disallowed fallback. Task 6: parse_coauthor and
 badge_pair_extraordinaire — merged PRs whose commits carry a
-Co-authored-by trailer.
+Co-authored-by trailer. Task 7: main() CLI wiring — subcommands
+doctor/publish/status/unlock/manual, the unlock orchestration with its
+ownership guard and per-badge failure summary, dry-run planning, and
+the manual steps for the non-automatable badges.
 """
 
 import base64
@@ -1255,6 +1258,238 @@ class InterfaceTests(unittest.TestCase):
 
     def test_log_path_constant(self):
         self.assertEqual(ga.LOG_PATH, "achievement_run.log")
+
+
+class ManualCommandTests(unittest.TestCase):
+    """main(["manual"]): exact steps for the two manual badges, exit 0."""
+
+    def test_manual_exits_zero_prints_both_badge_guides(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ga.main(["manual"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("Public Sponsor", out)
+        self.assertIn("Starstruck", out)
+        # Public Sponsor: $1 sponsorship via github.com/sponsors,
+        # needs a real payment
+        self.assertIn("https://github.com/sponsors", out)
+        self.assertIn("$1", out)
+        self.assertIn("payment", out.lower())
+        # Starstruck: 16 stars from OTHER people — self-stars don't count
+        self.assertIn("16", out)
+        self.assertIn("other people", out.lower())
+
+
+class MissingTokenCliTests(unittest.TestCase):
+    def test_missing_token_exits_1_with_pat_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, ".env")
+            with mock.patch.object(ga, "ENV_PATH", missing), \
+                    mock.patch.dict(os.environ):
+                os.environ.pop("GITHUB_TOKEN", None)
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    with self.assertRaises(SystemExit) as cm:
+                        ga.main(["unlock"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn(PAT_URL, buf.getvalue())
+
+
+class MainTests(ClientTestCase):
+    """Task 7: main() wiring — unlock orchestration, ownership guard,
+    dry-run planning, manual steps."""
+
+    REPO_PATH = "/repos/octocat/achievement"
+
+    def _fake_client(self, can_mark=True, fail=()):
+        """A MagicMock standing in for GitHubClient(token).
+
+        rest/graphql dispatch over canned octocat/achievement data; any
+        path listed in ``fail`` raises GHError(403). Returns
+        ``(client, calls)`` where calls records every dispatched
+        ``("rest", method, path)`` / ``("graphql", query)``.
+        """
+        client = mock.MagicMock()
+        client.dry_run = False
+        calls = []
+
+        def fake_rest(method, path, body=None):
+            calls.append(("rest", method, path))
+            if path in fail:
+                raise ga.GHError(403, "blocked by test")
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == self.REPO_PATH:
+                return {"name": "achievement",
+                        "owner": {"login": "octocat"},
+                        "default_branch": "main",
+                        "html_url":
+                            "https://github.com/octocat/achievement"}
+            return {}
+
+        def fake_graphql(query, variables=None):
+            calls.append(("graphql", query))
+            if "repository(" in query:
+                return {"repository": {
+                    "id": "R_1",
+                    "discussionCategories": {"nodes": [
+                        {"id": "C_qa", "name": "Q&A",
+                         "isAnswerable": True}]},
+                    "discussions": {"nodes": []}}}
+            if "createDiscussion" in query:
+                return {"createDiscussion": {"discussion":
+                        {"id": "D_1", "number": 1}}}
+            if "addDiscussionComment" in query:
+                return {"addDiscussionComment": {"comment": {
+                    "id": "CM_1",
+                    "viewerCanMarkAsAnswer": can_mark}}}
+            return {}
+
+        client.rest.side_effect = fake_rest
+        client.graphql.side_effect = fake_graphql
+        return client, calls
+
+    def _run_main(self, argv, client):
+        out, err = io.StringIO(), io.StringIO()
+        completed = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout="pushed", stderr="")
+        with mock.patch.object(ga, "GitHubClient", return_value=client), \
+                mock.patch("subprocess.run", return_value=completed), \
+                redirect_stdout(out), redirect_stderr(err):
+            rc = ga.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_unlock_dry_run_zero_http_calls_and_every_badge_name(self):
+        """Dry-run constructs only a dry-run client (never a live one),
+        makes zero HTTP calls and zero git subprocesses, and the printed
+        plan mentions every badge name it covers."""
+        init_calls = []
+
+        class SpyClient(ga.GitHubClient):
+            def __init__(self, token, dry_run=False, delay=2.5):
+                init_calls.append(dry_run)
+                super().__init__(token, dry_run=dry_run, delay=delay)
+
+        buf = io.StringIO()
+        with mock.patch.object(ga, "GitHubClient", SpyClient), \
+                mock.patch("urllib.request.urlopen") as m_open, \
+                mock.patch("subprocess.run") as m_run, \
+                redirect_stdout(buf):
+            rc = ga.main(["unlock", "--dry-run", "--token", "t",
+                          "--coauthor", "Ada Lovelace <ada@x.io>"])
+        self.assertEqual(rc, 0, msg=buf.getvalue())
+        m_open.assert_not_called()
+        m_run.assert_not_called()
+        self.assertEqual(init_calls, [True])  # only the dry-run client
+        out = buf.getvalue()
+        for name in ("Quickdraw", "YOLO", "Pull Shark", "Galaxy Brain",
+                     "Pair Extraordinaire"):
+            self.assertIn(name, out)
+        self.assertIn("DRY-RUN", out)
+        # publish's git commands are dry-run printed, not executed
+        self.assertIn("DRY-RUN git push -u origin main", out)
+
+    def test_unlock_runs_badges_in_order_and_skips_pair_with_notice(self):
+        client, calls = self._fake_client()
+        rc, out, err = self._run_main(
+            ["unlock", "--token", "t", "--tier", "base"], client)
+        self.assertEqual(rc, 0, msg=out + err)
+        # plan header announces the badge sequence
+        self.assertIn("Unlock plan", out)
+        # execution order: quickdraw -> yolo -> pull shark -> galaxy brain
+        markers = [
+            "Quickdraw: opened and closed issue",
+            "YOLO: merged PR",
+            "Pull Shark: 0/1 merged",
+            "Galaxy Brain: 0/1 accepted answers",
+            'Pair Extraordinaire: skipped - pass --coauthor "Name <email>"',
+        ]
+        positions = [out.index(m) for m in markers]
+        self.assertEqual(positions, sorted(positions),
+                        msg=f"badges ran out of order: {out}")
+        # base tier = one cycle per badge
+        self.assertIn("running 1 PR cycle", out)
+        # summary table marks the skipped badge (not a failure)
+        self.assertIn("Unlock summary", out)
+        self.assertRegex(out, r"Pair Extraordinaire\s+SKIPPED")
+        # pair was never attempted
+        self.assertNotIn("Pair Extraordinaire PR", out)
+
+    def test_unlock_with_coauthor_runs_pair_cycle_with_trailer(self):
+        client, calls = self._fake_client()
+        with mock.patch.object(ga, "pr_cycle", return_value=7) as m_cycle:
+            rc, out, err = self._run_main(
+                ["unlock", "--token", "t", "--tier", "base",
+                 "--coauthor", "Ada Lovelace <ada@x.io>"], client)
+        self.assertEqual(rc, 0, msg=out + err)
+        self.assertRegex(out, r"Pair Extraordinaire\s+OK")
+        pair_calls = [c for c in m_cycle.call_args_list
+                     if "Pair Extraordinaire PR" in c.args[4]]
+        self.assertEqual(len(pair_calls), 1)
+        self.assertTrue(
+            pair_calls[0].args[4].endswith(
+                "\n\nCo-authored-by: Ada Lovelace <ada@x.io>"),
+            msg=f"message lacks trailer: {pair_calls[0].args[4]!r}")
+
+    def test_unlock_galaxy_self_mark_blocked_is_warning_not_failure(self):
+        client, calls = self._fake_client(can_mark=False)
+        rc, out, err = self._run_main(
+            ["unlock", "--token", "t", "--tier", "base"], client)
+        self.assertEqual(rc, 0, msg=out + err)
+        self.assertRegex(out, r"Galaxy Brain\s+WARNING")
+        self.assertIn("fallback", out.lower())
+        # self-mark blocked: the mark mutation was never attempted
+        queries = [c[1] for c in calls if c[0] == "graphql"]
+        self.assertFalse(any("markDiscussionCommentAsAnswer" in q
+                             for q in queries))
+
+    def test_unlock_badge_failure_exits_1_and_continues_other_badges(self):
+        client, calls = self._fake_client(
+            fail=("/repos/octocat/achievement/issues",))
+        rc, out, err = self._run_main(
+            ["unlock", "--token", "t", "--tier", "base"], client)
+        self.assertEqual(rc, 1)
+        self.assertRegex(out, r"Quickdraw\s+FAILED")
+        # other badges still ran
+        self.assertIn("YOLO: merged PR", out)
+        self.assertIn("Pull Shark: 0/1 merged", out)
+        self.assertIn("Galaxy Brain", out)
+        self.assertIn("Unlock summary", out)
+
+    def test_unlock_rejects_repo_owned_by_another_user(self):
+        client, calls = self._fake_client()
+
+        def hostile_rest(method, path, body=None):
+            calls.append(("rest", method, path))
+            if path == "/user":
+                return {"login": "octocat"}
+            if path == "/repos/someone/achievement":
+                return {"name": "achievement",
+                        "owner": {"login": "someone-else"}}
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        client.rest.side_effect = hostile_rest
+        rc, out, err = self._run_main(
+            ["unlock", "--token", "t",
+             "--repo", "someone/achievement"], client)
+        self.assertEqual(rc, 1)
+        self.assertIn("own", err)  # message names the own-repos-only rule
+        # stopped before any badge ran or any write was attempted
+        self.assertNotIn("Unlock plan", out)
+        mutating = [(m, p) for kind, m, p in calls
+                    if kind == "rest"
+                    and m in ("POST", "PUT", "PATCH", "DELETE")]
+        self.assertEqual(mutating, [])
+
+    def test_unlock_rejects_malformed_repo_argument(self):
+        client, calls = self._fake_client()
+        rc, out, err = self._run_main(
+            ["unlock", "--token", "t", "--repo", "a/b/c"], client)
+        self.assertEqual(rc, 1)
+        self.assertIn("OWNER/NAME", err)
+        # rejected before any API call was made
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
