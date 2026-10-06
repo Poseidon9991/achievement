@@ -5,12 +5,15 @@ Single-file, stdlib-only CLI. Task 1 provides the core plumbing:
 Retry-After backoff), token loading (``--token`` > ``GITHUB_TOKEN`` > ``.env``),
 an activity log that never writes the token, and shared constants/helpers
 (``TIER_TARGETS``, ``format_coauthor_trailer``) used by the badge tasks.
+Task 2 adds ``cmd_doctor`` (token health check) and ``cmd_status`` (scrapes
+the public profile page for earned achievements via ``parse_profile_badges``).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -34,6 +37,42 @@ TIER_TARGETS = {
     "galaxy_brain": 8,
     "pair_extraordinaire": 10,
 }
+
+# Every achievement display name the profile parser recognizes — including
+# the retired one-off event badges (Arctic/Mars), which still render on the
+# profiles of users who earned them.
+KNOWN_BADGES = (
+    "Quickdraw",
+    "Pull Shark",
+    "Galaxy Brain",
+    "YOLO",
+    "Pair Extraordinaire",
+    "Starstruck",
+    "Public Sponsor",
+    "Arctic Code Vault Contributor",
+    "Mars 2020 Contributor",
+    "Heart On Your Sleeve",
+    "Open Sourcerer",
+)
+
+# The 9 earnable badges shown by `status`, mapped to their Bronze-tier
+# target ("manual" = cannot be driven by this tool; "n/a" = never released
+# or rolled back, shown for completeness of the profile display).
+STATUS_BADGE_TARGETS = {
+    "Quickdraw": TIER_TARGETS["quickdraw"],
+    "Pull Shark": TIER_TARGETS["pull_shark"],
+    "Galaxy Brain": TIER_TARGETS["galaxy_brain"],
+    "YOLO": TIER_TARGETS["yolo"],
+    "Pair Extraordinaire": TIER_TARGETS["pair_extraordinaire"],
+    "Starstruck": "manual",
+    "Public Sponsor": "manual",
+    "Heart On Your Sleeve": "n/a",
+    "Open Sourcerer": "n/a",
+}
+
+_BADGE_ATTR_RE = re.compile(
+    r"""(?:alt|aria-label)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_ACHIEVEMENT_PREFIX_RE = re.compile(r"^\s*achievement\s*:\s*", re.IGNORECASE)
 
 
 class GHError(Exception):
@@ -209,3 +248,91 @@ class GitHubClient:
             raise GHError(200, f"GraphQL errors: {message}")
         data = result.get("data")
         return data if isinstance(data, dict) else result
+
+
+def parse_profile_badges(html: str) -> list[str]:
+    """Extract achievement names from a GitHub profile page's achievements
+    section.
+
+    Badge names appear in ``alt``/``aria-label`` attributes in that section,
+    sometimes prefixed with ``"Achievement: "`` (e.g. ``alt="Quickdraw"``,
+    ``aria-label="Achievement: YOLO"``). Unknown attribute values are
+    ignored; a profile with zero badges returns ``[]``. Results are deduped
+    in first-seen (document) order.
+    """
+    known = set(KNOWN_BADGES)
+    earned: list[str] = []
+    for match in _BADGE_ATTR_RE.finditer(html):
+        name = _ACHIEVEMENT_PREFIX_RE.sub("", match.group(1)).strip()
+        if name in known and name not in earned:
+            earned.append(name)
+    return earned
+
+
+def cmd_doctor(client: GitHubClient) -> None:
+    """Check token health via ``GET /user``; print login and plan summary.
+
+    On HTTP 401 prints the PAT fallback instructions (URL, scopes) to stderr
+    and raises ``SystemExit(1)``; any other ``GHError`` is reported and also
+    exits 1. The token is never printed.
+    """
+    try:
+        user = client.rest("GET", "/user")
+    except GHError as exc:
+        if exc.status == 401:
+            print(
+                "Token rejected by GitHub (401 Unauthorized).\n"
+                f"Create a new personal access token at {PAT_URL} "
+                "(scopes: repo, read:discussion, write:discussion), then "
+                "retry via --token, GITHUB_TOKEN, or .env.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"GitHub check failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    login = user.get("login", "<unknown>")
+    plan = user.get("plan") or {}
+    plan_name = plan.get("name", "unknown")
+    print(f"Token OK. Authenticated as {login} (plan: {plan_name}).")
+    client.log(f"doctor: authenticated as {login} (plan: {plan_name})")
+
+
+def cmd_status(client: GitHubClient) -> None:
+    """Scrape ``https://github.com/{login}`` for earned achievements and
+    print a target/earned table for the 9 earnable badges.
+
+    The profile fetch goes through bare ``urllib`` with no ``Authorization``
+    header — the achievements section is public. ``GET /user`` (via the
+    authed client) supplies the login; API/network failures exit 1.
+    """
+    try:
+        user = client.rest("GET", "/user")
+    except GHError as exc:
+        print(f"GitHub check failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    login = user.get("login")
+    if not login:
+        print("Could not resolve the authenticated user's login.",
+              file=sys.stderr)
+        raise SystemExit(1)
+    url = f"https://github.com/{login}"
+    request = urllib.request.Request(url)
+    request.add_header("Accept", "text/html")
+    request.add_header("User-Agent", "github-achievements-cli")
+    try:
+        with urllib.request.urlopen(
+                request, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"Could not fetch {url}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    earned = set(parse_profile_badges(html))
+    print(f"Achievements for {url} "
+          "(may lag real progress by up to 24-48h)\n")
+    name_w = max(len(name) for name in STATUS_BADGE_TARGETS)
+    print(f"{'Badge':<{name_w}}  {'Target':<8}  Earned")
+    for name, target in STATUS_BADGE_TARGETS.items():
+        mark = "yes" if name in earned else "no"
+        print(f"{name:<{name_w}}  {str(target):<8}  {mark}")
+    client.log(f"status: {login} earned="
+               f"{','.join(sorted(earned)) or 'none'}")

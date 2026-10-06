@@ -1,4 +1,8 @@
-"""Tests for github_achievements.py — Task 1: client core + token loading."""
+"""Tests for github_achievements.py — Tasks 1-2.
+
+Task 1: client core + token loading. Task 2: doctor/status commands and
+profile badge parsing.
+"""
 
 import io
 import json
@@ -39,6 +43,39 @@ def _http_error(status: int, payload: dict, headers: dict | None = None):
         hdrs=headers or {},
         fp=io.BytesIO(json.dumps(payload).encode("utf-8")),
     )
+
+
+# Fixture: the achievements section of a GitHub profile page. Badge names
+# appear in img `alt` and link `aria-label` attributes (sometimes prefixed
+# with "Achievement: "); Pull Shark appears twice to exercise dedupe.
+PROFILE_HTML_WITH_BADGES = """
+<div class="border-top color-border-muted pt-3 mt-3 d-none d-md-block">
+  <h2 class="h4 mb-2">Achievements</h2>
+  <div class="d-flex flex-wrap">
+    <a href="/octocat?achievement=quickdraw&tab=achievements">
+      <img src="https://github.githubassets.com/assets/quickdraw-default.png"
+           alt="Quickdraw" width="64" height="64">
+    </a>
+    <a href="/octocat?achievement=pull-shark&tab=achievements"
+       aria-label="Pull Shark">
+      <img src="pull-shark.png" alt="Pull Shark" width="64" height="64">
+    </a>
+    <a href="/octocat?achievement=yolo&tab=achievements">
+      <img src="yolo.png" aria-label="Achievement: YOLO" width="64">
+    </a>
+  </div>
+</div>
+"""
+
+PROFILE_HTML_NO_BADGES = """
+<html><body>
+  <div class="position-relative">
+    <h2 class="h4 mb-2">Achievements</h2>
+    <img src="avatar.png" alt="@octocat" width="64">
+    <p>Nothing earned yet.</p>
+  </div>
+</body></html>
+"""
 
 
 class LoadTokenTests(unittest.TestCase):
@@ -281,6 +318,80 @@ class LogTests(unittest.TestCase):
         self.assertNotIn(token, contents)
         self.assertIn("GET /user", contents)
         self.assertIn("-> 200", contents)
+
+
+class ParseProfileBadgesTests(unittest.TestCase):
+    def test_extracts_three_badges_in_document_order(self):
+        self.assertEqual(
+            ga.parse_profile_badges(PROFILE_HTML_WITH_BADGES),
+            ["Quickdraw", "Pull Shark", "YOLO"],
+        )
+
+    def test_empty_profile_returns_empty_list(self):
+        self.assertEqual(ga.parse_profile_badges(PROFILE_HTML_NO_BADGES), [])
+
+    def test_empty_input_returns_empty_list(self):
+        self.assertEqual(ga.parse_profile_badges(""), [])
+
+    def test_ignores_unknown_alt_and_aria_labels(self):
+        html = ('<img src="a.png" alt="Not A Badge">'
+                '<a aria-label="Sponsor octocat" href="#">x</a>'
+                '<img src="b.png" alt="Starstruck">')
+        self.assertEqual(ga.parse_profile_badges(html), ["Starstruck"])
+
+
+class DoctorTests(ClientTestCase):
+    def test_401_prints_pat_fallback_and_exits_1(self):
+        client = ga.GitHubClient("bad-token", delay=0)
+        with mock.patch.object(
+                client, "rest",
+                side_effect=ga.GHError(401, "Bad credentials")):
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    ga.cmd_doctor(client)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn(PAT_URL, buf.getvalue())
+        self.assertNotIn("bad-token", buf.getvalue())
+
+    def test_success_prints_login_and_plan(self):
+        client = ga.GitHubClient("tok", delay=0)
+        payload = {"login": "octocat", "plan": {"name": "free"}}
+        with mock.patch.object(client, "rest", return_value=payload):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ga.cmd_doctor(client)
+        out = buf.getvalue()
+        self.assertIn("octocat", out)
+        self.assertIn("free", out)
+
+
+class StatusTests(ClientTestCase):
+    def test_fetches_profile_unauthenticated_and_prints_table(self):
+        client = ga.GitHubClient("sekrit-token", delay=0)
+        with mock.patch.object(
+                client, "rest", return_value={"login": "octocat"}), \
+                mock.patch("urllib.request.urlopen") as m_open:
+            m_open.return_value = _make_response(
+                PROFILE_HTML_WITH_BADGES.encode("utf-8"))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ga.cmd_status(client)
+        req = m_open.call_args[0][0]
+        self.assertEqual(req.full_url, "https://github.com/octocat")
+        self.assertIsNone(req.get_header("Authorization"))
+        out = buf.getvalue()
+        # all 9 earnable badges listed in the target/earned table
+        for name in ("Quickdraw", "Pull Shark", "Galaxy Brain", "YOLO",
+                     "Pair Extraordinaire", "Starstruck", "Public Sponsor",
+                     "Heart On Your Sleeve", "Open Sourcerer"):
+            self.assertIn(name, out)
+        # earned/unearned rows are marked per the scraped profile
+        self.assertRegex(out, r"Quickdraw.*yes")
+        self.assertRegex(out, r"Galaxy Brain.*no")
+        # retired event badges are not part of the earnable table
+        self.assertNotIn("Arctic Code Vault", out)
+        self.assertNotIn("Mars 2020", out)
 
 
 class InterfaceTests(unittest.TestCase):
