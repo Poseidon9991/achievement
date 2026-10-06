@@ -12,6 +12,9 @@ Task 3 adds ``cmd_publish`` (create-or-reuse the playground repo, add the
 ``count_merged_prs`` plus the ``pr_cycle`` create-branch/commit/PR/merge/
 cleanup pipeline — and the three badge drivers built on it:
 ``badge_quickdraw``, ``badge_yolo``, and ``badge_pull_shark``.
+Task 5 adds ``badge_galaxy_brain`` — Discussions Q&A over GraphQL
+(createDiscussion -> addDiscussionComment -> markDiscussionCommentAsAnswer)
+with a clean fallback when GitHub disallows self-marking answers.
 """
 
 from __future__ import annotations
@@ -686,5 +689,159 @@ def badge_pull_shark(client: GitHubClient, owner: str, repo: str,
         done += 1
         print(f"  merged PR #{number} ({done}/{remaining})")
     client.log(f"pull_shark: {owner}/{repo} ran {done} cycle(s) "
+               f"toward {target}")
+    return done
+
+
+def badge_galaxy_brain(client: GitHubClient, owner: str, repo: str,
+                       target: int) -> int:
+    """Post self-answered Discussions until ``target`` accepted answers
+    exist in ``owner/repo``; returns how many answers were created this
+    invocation, ``0`` when already at target, or ``-1`` when GitHub
+    disallows self-marking answers.
+
+    Steps:
+
+    1. ``PATCH /repos/{o}/{r}`` ``{"has_discussions": true}`` — enabling
+       Discussions is idempotent, and on first enable GitHub seeds
+       default categories including an answerable Q&A one.
+    2. One GraphQL ``repository`` query fetches the repo node ``id``,
+       ``discussionCategories(first: 20)`` and ``discussions(first: 50)``
+       — the latter counts prior progress: discussions whose
+       ``answer.author.login`` equals the authenticated login already
+       count toward the target (idempotent re-runs).
+    3. The first ``isAnswerable`` category is used; when none exists a
+       ``createDiscussionCategory`` mutation makes a ``"Q&A"`` category
+       with ``format: QUESTIONS_ANSWERS`` and its id is used instead.
+    4. Per remaining answer: ``createDiscussion`` (a question),
+       ``addDiscussionComment`` (the answer), then — only when the
+       returned comment's ``viewerCanMarkAsAnswer`` is true —
+       ``markDiscussionCommentAsAnswer`` with the *comment* node id.
+
+    Self-marking may be disallowed: the moment a comment reports
+    ``viewerCanMarkAsAnswer: false`` the badge stops, prints the fallback
+    note (a partner marks the answers, or 2 manual "Select as answer"
+    clicks per discussion in the repo UI), and returns ``-1`` — no mark
+    mutation and no further discussions are attempted. In dry-run mode
+    every call prints as ``DRY-RUN`` and returns ``{}``; the badge then
+    just prints how many discussion/comment/mark steps it would run and
+    returns ``0`` without touching the missing response fields.
+    """
+    base = f"/repos/{owner}/{repo}"
+    login = client.rest("GET", "/user").get("login")
+    client.rest("PATCH", base, {"has_discussions": True})
+
+    data = client.graphql(
+        "query($owner:String!,$name:String!){"
+        " repository(owner:$owner,name:$name){"
+        "  id"
+        "  discussionCategories(first:20){nodes{id name isAnswerable}}"
+        "  discussions(first:50){nodes{answer{author{login}}}}"
+        " }"
+        "}",
+        {"owner": owner, "name": repo})
+    repository = data.get("repository") or {}
+    repo_id = repository.get("id")
+
+    categories = ((repository.get("discussionCategories") or {})
+                  .get("nodes") or [])
+    category_id = next(
+        (c.get("id") for c in categories
+         if isinstance(c, dict) and c.get("isAnswerable") and c.get("id")),
+        None)
+    if category_id is None and repo_id:
+        created = client.graphql(
+            "mutation($repoId:ID!){"
+            " createDiscussionCategory(input:{repositoryId:$repoId,"
+            "name:\"Q&A\",format:QUESTIONS_ANSWERS}){"
+            "  discussionCategory{id}"
+            " }"
+            "}",
+            {"repoId": repo_id})
+        category_id = ((created.get("createDiscussionCategory") or {})
+                       .get("discussionCategory") or {}).get("id")
+
+    discussions = ((repository.get("discussions") or {})
+                   .get("nodes") or [])
+    answered = sum(
+        1 for d in discussions
+        if isinstance(d, dict)
+        and ((d.get("answer") or {}).get("author") or {})
+            .get("login") == login)
+    remaining = max(0, target - answered)
+
+    if client.dry_run:
+        print(f"Galaxy Brain: would create {remaining} discussion(s) "
+              f"with one answer comment each and mark each comment as "
+              f"the answer ({answered}/{target} already accepted).")
+        client.log(f"galaxy_brain: {owner}/{repo} dry-run plan: "
+                   f"{remaining} discussion+comment+mark cycle(s)")
+        return 0
+    if remaining == 0:
+        print(f"Galaxy Brain: already at {answered}/{target} accepted "
+              "answers; nothing to do.")
+        client.log(f"galaxy_brain: {owner}/{repo} already at "
+                   f"{answered}/{target}")
+        return 0
+    print(f"Galaxy Brain: {answered}/{target} accepted answers; posting "
+          f"{remaining} self-answered discussion(s).")
+
+    done = 0
+    for i in range(remaining):
+        n = answered + i + 1
+        created = client.graphql(
+            "mutation($repoId:ID!,$categoryId:ID!,$title:String!,"
+            "$body:String!){"
+            " createDiscussion(input:{repositoryId:$repoId,"
+            "categoryId:$categoryId,title:$title,body:$body}){"
+            "  discussion{id number}"
+            " }"
+            "}",
+            {"repoId": repo_id, "categoryId": category_id,
+             "title": f"Galaxy Brain Q&A {n}/{target}",
+             "body": "Question posted automatically by "
+                     "github_achievements for the Galaxy Brain "
+                     "achievement."})
+        discussion = ((created.get("createDiscussion") or {})
+                      .get("discussion") or {})
+
+        commented = client.graphql(
+            "mutation($discussionId:ID!,$body:String!){"
+            " addDiscussionComment(input:{discussionId:$discussionId,"
+            "body:$body}){"
+            "  comment{id viewerCanMarkAsAnswer}"
+            " }"
+            "}",
+            {"discussionId": discussion.get("id"),
+             "body": "The answer — posted and marked automatically by "
+                     "github_achievements."})
+        comment = ((commented.get("addDiscussionComment") or {})
+                   .get("comment") or {})
+        if not comment.get("viewerCanMarkAsAnswer"):
+            print(
+                "Galaxy Brain: GitHub will not let this account mark its "
+                "own comment as the answer (viewerCanMarkAsAnswer="
+                "false); stopping this badge.\n"
+                "Fallback: have a partner account mark your comments as "
+                "answers, or open each discussion under "
+                f"https://github.com/{owner}/{repo}/discussions and "
+                "click \"Select as answer\" yourself (2 clicks per "
+                "discussion).")
+            client.log(f"galaxy_brain: {owner}/{repo} self-mark "
+                       "disallowed; stopped for manual/partner fallback")
+            return -1
+        client.graphql(
+            "mutation($commentId:ID!){"
+            " markDiscussionCommentAsAnswer(input:{id:$commentId}){"
+            "  comment{id isAnswer}"
+            " }"
+            "}",
+            {"commentId": comment.get("id")})
+        done += 1
+        number = discussion.get("number")
+        print(f"  answered discussion "
+              f"#{number if number is not None else '?'} "
+              f"({done}/{remaining})")
+    client.log(f"galaxy_brain: {owner}/{repo} ran {done} answer(s) "
                f"toward {target}")
     return done

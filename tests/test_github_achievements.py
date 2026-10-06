@@ -1,9 +1,10 @@
-"""Tests for github_achievements.py — Tasks 1-4.
+"""Tests for github_achievements.py — Tasks 1-5.
 
 Task 1: client core + token loading. Task 2: doctor/status commands and
 profile badge parsing. Task 3: publish command (repo creation + git push).
 Task 4: PR engine (pr_cycle, count_merged_prs) plus the quickdraw, yolo,
-and pull-shark badge drivers.
+and pull-shark badge drivers. Task 5: badge_galaxy_brain — Discussions
+Q&A with a self-mark-disallowed fallback.
 """
 
 import base64
@@ -892,6 +893,205 @@ class PullSharkTests(ClientTestCase):
             result = ga.badge_pull_shark(client, "octocat", "achievement", 16)
         m_cycle.assert_not_called()
         self.assertEqual(result, 0)
+
+
+class GalaxyBrainTests(ClientTestCase):
+    """badge_galaxy_brain: enable Discussions, pick (or create) an
+    answerable category, then post self-answered Q&A discussions until
+    `target` accepted answers exist."""
+
+    def _harness(self, categories=None, discussions=None, can_mark=True):
+        """Fake rest/graphql dispatchers over canned repo data.
+
+        Returns (calls, fake_rest, fake_graphql). `calls` records tuples:
+        ("rest", method, path, body) and ("graphql", query, variables).
+        GraphQL replies are shaped like the real API payloads.
+        """
+        calls = []
+        repo_data = {
+            "id": "R_play",
+            "discussionCategories": {"nodes": categories or []},
+            "discussions": {"nodes": discussions or []},
+        }
+        seq = {"n": 0}
+
+        def fake_rest(method, path, body=None):
+            calls.append(("rest", method, path, body))
+            if path == "/user":
+                return {"login": "octocat"}
+            return {}
+
+        def fake_graphql(query, variables=None):
+            calls.append(("graphql", query, variables))
+            if "createDiscussionCategory" in query:
+                return {"createDiscussionCategory":
+                        {"discussionCategory": {"id": "C_new"}}}
+            if "createDiscussion" in query:
+                seq["n"] += 1
+                return {"createDiscussion": {"discussion": {
+                    "id": f"D_{seq['n']}", "number": seq["n"]}}}
+            if "addDiscussionComment" in query:
+                return {"addDiscussionComment": {"comment": {
+                    "id": f"CM_{seq['n']}",
+                    "viewerCanMarkAsAnswer": can_mark}}}
+            if "markDiscussionCommentAsAnswer" in query:
+                return {"markDiscussionCommentAsAnswer":
+                        {"comment": {"id": "CM", "isAnswer": True}}}
+            return {"repository": repo_data}
+        return calls, fake_rest, fake_graphql
+
+    def _run(self, client, fake_rest, fake_graphql, target):
+        buf = io.StringIO()
+        with mock.patch.object(client, "rest", side_effect=fake_rest), \
+                mock.patch.object(client, "graphql",
+                                  side_effect=fake_graphql), \
+                redirect_stdout(buf):
+            result = ga.badge_galaxy_brain(client, "o", "r", target)
+        return result, buf.getvalue()
+
+    def _queries(self, calls):
+        return [c[1] for c in calls if c[0] == "graphql"]
+
+    def test_enables_discussions_with_has_discussions_patch(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls, fr, fg = self._harness(
+            categories=[{"id": "C_qa", "name": "Q&A",
+                         "isAnswerable": True}])
+        result, _ = self._run(client, fr, fg, target=1)
+        self.assertEqual(result, 1)
+        patches = [c for c in calls if c[0] == "rest" and c[1] == "PATCH"]
+        self.assertEqual(patches, [("rest", "PATCH", "/repos/o/r",
+                                    {"has_discussions": True})])
+
+    def test_selects_existing_answerable_category(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls, fr, fg = self._harness(categories=[
+            {"id": "C_gen", "name": "General", "isAnswerable": False},
+            {"id": "C_qa", "name": "Q&A", "isAnswerable": True},
+        ])
+        self._run(client, fr, fg, target=1)
+        queries = self._queries(calls)
+        # an answerable category already exists -> no creation mutation
+        self.assertFalse(any("createDiscussionCategory" in q
+                             for q in queries))
+        create_vars = [c[2] for c in calls
+                       if c[0] == "graphql" and "createDiscussion(" in c[1]]
+        self.assertTrue(create_vars)
+        for v in create_vars:
+            self.assertEqual(v["repoId"], "R_play")
+            self.assertEqual(v["categoryId"], "C_qa")
+
+    def test_creates_qa_category_when_none_answerable(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls, fr, fg = self._harness(categories=[
+            {"id": "C_gen", "name": "General", "isAnswerable": False},
+        ])
+        result, _ = self._run(client, fr, fg, target=1)
+        self.assertEqual(result, 1)
+        cat_queries = [q for q in self._queries(calls)
+                       if "createDiscussionCategory" in q]
+        self.assertEqual(len(cat_queries), 1)
+        self.assertIn("Q&A", cat_queries[0])
+        self.assertIn("QUESTIONS_ANSWERS", cat_queries[0])
+        cat_vars = [c[2] for c in calls
+                    if c[0] == "graphql"
+                    and "createDiscussionCategory" in c[1]]
+        self.assertEqual(cat_vars, [{"repoId": "R_play"}])
+        # the new category id feeds the createDiscussion input
+        create_vars = [c[2] for c in calls
+                       if c[0] == "graphql" and "createDiscussion(" in c[1]]
+        self.assertEqual(create_vars[0]["categoryId"], "C_new")
+
+    def test_each_answer_creates_comments_and_marks_in_order(self):
+        client = ga.GitHubClient("tok", delay=0)
+        calls, fr, fg = self._harness(
+            categories=[{"id": "C_qa", "name": "Q&A",
+                         "isAnswerable": True}])
+        result, _ = self._run(client, fr, fg, target=2)
+        self.assertEqual(result, 2)
+        mutating = [q for q in self._queries(calls)
+                    if q.lstrip().startswith("mutation")]
+        # create -> comment -> mark, once per answer
+        self.assertEqual(len(mutating), 6)
+        self.assertEqual(
+            ["createDiscussion(" in q for q in mutating],
+            [True, False, False, True, False, False])
+        self.assertEqual(
+            ["addDiscussionComment" in q for q in mutating],
+            [False, True, False, False, True, False])
+        # markDiscussionCommentAsAnswer takes the COMMENT node id
+        mark_vars = [c[2] for c in calls if c[0] == "graphql"
+                     and "markDiscussionCommentAsAnswer" in c[1]]
+        self.assertEqual(mark_vars, [{"commentId": "CM_1"},
+                                     {"commentId": "CM_2"}])
+
+    def test_prior_accepted_answers_count_toward_target(self):
+        client = ga.GitHubClient("tok", delay=0)
+        discussions = [
+            {"answer": {"author": {"login": "octocat"}}},
+            {"answer": {"author": {"login": "octocat"}}},
+            {"answer": {"author": {"login": "someone-else"}}},
+            {"answer": None},
+            {},
+        ]
+        calls, fr, fg = self._harness(
+            categories=[{"id": "C_qa", "name": "Q&A",
+                         "isAnswerable": True}],
+            discussions=discussions)
+        result, _ = self._run(client, fr, fg, target=4)
+        # 2 of the 4 answers already exist -> only 2 cycles run
+        self.assertEqual(result, 2)
+        queries = self._queries(calls)
+        self.assertEqual(sum("createDiscussion(" in q for q in queries), 2)
+        self.assertEqual(
+            sum("markDiscussionCommentAsAnswer" in q for q in queries), 2)
+
+    def test_already_at_target_creates_nothing(self):
+        client = ga.GitHubClient("tok", delay=0)
+        discussions = [{"answer": {"author": {"login": "octocat"}}}
+                       for _ in range(8)]
+        calls, fr, fg = self._harness(
+            categories=[{"id": "C_qa", "name": "Q&A",
+                         "isAnswerable": True}],
+            discussions=discussions)
+        result, out = self._run(client, fr, fg, target=8)
+        self.assertEqual(result, 0)
+        queries = self._queries(calls)
+        self.assertFalse(any("createDiscussion(" in q for q in queries))
+        self.assertIn("8/8", out)
+
+    def test_self_mark_disallowed_returns_minus_one_and_stops(self):
+        """viewerCanMarkAsAnswer=false -> stop the badge: return -1,
+        print the fallback note, and never run markDiscussionCommentAsAnswer
+        or a second discussion."""
+        client = ga.GitHubClient("tok", delay=0)
+        calls, fr, fg = self._harness(
+            categories=[{"id": "C_qa", "name": "Q&A",
+                         "isAnswerable": True}],
+            can_mark=False)
+        result, out = self._run(client, fr, fg, target=3)
+        self.assertEqual(result, -1)
+        self.assertIn("fallback", out.lower())
+        queries = self._queries(calls)
+        self.assertFalse(any("markDiscussionCommentAsAnswer" in q
+                             for q in queries))
+        self.assertEqual(sum("createDiscussion(" in q for q in queries), 1)
+        self.assertEqual(sum("addDiscussionComment" in q for q in queries),
+                         1)
+
+    def test_dry_run_prints_plan_and_returns_zero(self):
+        """rest/graphql return {} in dry-run; the badge tolerates the
+        empty shapes, prints its planned steps, and returns 0."""
+        client = ga.GitHubClient("tok", dry_run=True, delay=0)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = ga.badge_galaxy_brain(client, "o", "r", 8)
+        self.assertEqual(result, 0)
+        out = buf.getvalue()
+        self.assertIn("DRY-RUN PATCH /repos/o/r", out)
+        self.assertIn('"has_discussions": true', out)
+        self.assertIn("8", out)
+        self.assertIn("discussion", out)
 
 
 class InterfaceTests(unittest.TestCase):
